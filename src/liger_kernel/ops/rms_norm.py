@@ -581,8 +581,22 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
                 **kernel_args,  # XPU-specific optimization
             )
         else:
-            BLOCK_ROW = 16
+            # Tune the block-row backward launch by hidden width. Small hidden
+            # sizes use more rows per program to amortize reduction and loop
+            # overhead, while wider rows benefit from additional warps.
+            if BLOCK_SIZE <= 64:
+                BLOCK_ROW, num_warps = 64, 4
+            elif BLOCK_SIZE <= 128:
+                BLOCK_ROW, num_warps = 64, 8
+            elif BLOCK_SIZE <= 256:
+                BLOCK_ROW, num_warps = 16, 4
+            else:  # BLOCK_SIZE <= _BLOCK_ROW_MAX_BLOCK_SIZE (512)
+                BLOCK_ROW, num_warps = 16, 8
             kernel_args["BLOCK_ROW"] = BLOCK_ROW
+            # The wider block-row specialization benefits from the deeper
+            # CUDA pipeline. Avoid passing num_stages to non-CUDA backends.
+            if BLOCK_SIZE > 256 and X.device.type == "cuda":
+                kernel_args["num_stages"] = 4
             _block_rms_norm_backward_kernel[grid](
                 dY,
                 dY.stride(0),
