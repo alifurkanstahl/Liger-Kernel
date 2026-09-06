@@ -34,6 +34,7 @@ from liger_kernel.transformers.relu_squared import LigerReLUSquared
 from liger_kernel.transformers.rms_norm import LigerRMSNorm
 from liger_kernel.transformers.rms_norm import LigerRMSNormForMuseGlimmer
 from liger_kernel.transformers.rms_norm import LigerRMSNormForMuseGlimmerTextCentered
+from liger_kernel.transformers.rms_norm import _liger_rms_norm_supports_grouped
 from liger_kernel.transformers.rope import liger_rotary_pos_emb
 from liger_kernel.transformers.rope import liger_rotary_pos_emb_vision
 from liger_kernel.transformers.swiglu import LigerBlockSparseTop2MLP
@@ -68,7 +69,13 @@ def _bind_method_to_module(module, method_name: str, new_method: Callable):
     module.__dict__[method_name] = new_method.__get__(module, module.__class__)
 
 
+def _bind_forward_to_module(module, new_method: Callable):
+    forward_attribute = "_old_forward" if hasattr(module, "_hf_hook") and hasattr(module, "_old_forward") else "forward"
+    _bind_method_to_module(module, forward_attribute, new_method)
+
+
 def _patch_rms_norm_module(module, offset=0.0, eps=1e-6, casting_mode="llama", in_place=True, row_mode=None):
+    supports_grouped = _liger_rms_norm_supports_grouped()
     # Check if the module is a PEFT ModulesToSaveWrapper
     # If it is, we need to patch the modules_to_save.default and original_modules
     if PEFT_AVAILABLE and isinstance(module, peft.utils.other.ModulesToSaveWrapper):
@@ -81,6 +88,8 @@ def _patch_rms_norm_module(module, offset=0.0, eps=1e-6, casting_mode="llama", i
         module.modules_to_save.default.row_mode = row_mode
         module.modules_to_save.default.impl = None
         module.modules_to_save.default.mode = None
+        module.modules_to_save.default._liger_rms_norm_patched = True
+        module.modules_to_save.default._liger_rms_norm_supports_grouped = supports_grouped
         module.original_module.offset = offset
         module.original_module.casting_mode = casting_mode
         module.original_module.variance_epsilon = (
@@ -90,9 +99,11 @@ def _patch_rms_norm_module(module, offset=0.0, eps=1e-6, casting_mode="llama", i
         module.original_module.row_mode = row_mode
         module.original_module.impl = None
         module.original_module.mode = None
-        _bind_method_to_module(module.modules_to_save.default, "forward", LigerRMSNorm.forward)
+        module.original_module._liger_rms_norm_patched = True
+        module.original_module._liger_rms_norm_supports_grouped = supports_grouped
+        _bind_forward_to_module(module.modules_to_save.default, LigerRMSNorm.forward)
         _bind_method_to_module(module.modules_to_save.default, "extra_repr", LigerRMSNorm.extra_repr)
-        _bind_method_to_module(module.original_module, "forward", LigerRMSNorm.forward)
+        _bind_forward_to_module(module.original_module, LigerRMSNorm.forward)
         _bind_method_to_module(module.original_module, "extra_repr", LigerRMSNorm.extra_repr)
         _bind_method_to_module(module.modules_to_save.default, "_get_name", lambda self: LigerRMSNorm.__name__)
         _bind_method_to_module(module.original_module, "_get_name", lambda self: LigerRMSNorm.__name__)
@@ -104,7 +115,9 @@ def _patch_rms_norm_module(module, offset=0.0, eps=1e-6, casting_mode="llama", i
         module.row_mode = row_mode
         module.impl = None
         module.mode = None
-        _bind_method_to_module(module, "forward", LigerRMSNorm.forward)
+        module._liger_rms_norm_patched = True
+        module._liger_rms_norm_supports_grouped = supports_grouped
+        _bind_forward_to_module(module, LigerRMSNorm.forward)
         _bind_method_to_module(module, "extra_repr", LigerRMSNorm.extra_repr)
         _bind_method_to_module(module, "_get_name", lambda self: LigerRMSNorm.__name__)
 
