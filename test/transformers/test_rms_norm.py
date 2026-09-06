@@ -19,6 +19,8 @@ from test.utils import set_seed
 from test.utils import supports_bfloat16
 
 from liger_kernel.ops import LigerRMSNormFunction
+from liger_kernel.ops.rms_norm import rms_norm_backward
+from liger_kernel.ops.rms_norm import rms_norm_forward
 from liger_kernel.transformers.functional import liger_rms_norm
 from liger_kernel.transformers.rms_norm import LigerRMSNorm
 from liger_kernel.utils import infer_comm_backend
@@ -107,6 +109,21 @@ class GemmaRMSNorm(nn.Module):
         return output.type_as(x)
 
 
+class GroupedGemmaRMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, group_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.group_size = group_size
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+
+    def forward(self, x):
+        input_dtype = x.dtype
+        grouped_x = x.float().reshape(*x.shape[:-1], -1, self.group_size)
+        output = grouped_x * torch.rsqrt(grouped_x.pow(2).mean(-1, keepdim=True) + self.eps)
+        output = output.flatten(-2) * (1.0 + self.weight.float())
+        return output.to(input_dtype)
+
+
 @pytest.mark.flaky(reruns=3, reruns_delay=2)
 @pytest.mark.parametrize(
     "bs, sl, hd",
@@ -191,6 +208,125 @@ def test_correctness(bs, sl, hd, dtype, atol, rtol, reference, offset, casting_m
     print(f"{h1.grad=}")
     print(f"{h2.grad=}")
     assert_verbose_allclose(h1.grad, h2.grad, atol=atol, rtol=rtol, max_print=20)
+
+
+@pytest.mark.parametrize(
+    "bs, sl, hd, group_size",
+    [
+        (2, 3, 128, 32),
+        (5, 7, 123, 41),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float32, 2e-5, 2e-5),
+        pytest.param(
+            torch.bfloat16,
+            2e-2,
+            2e-2,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+)
+def test_grouped_correctness(bs, sl, hd, group_size, dtype, atol, rtol):
+    tensor = torch.randn(bs, sl, hd, device=device, dtype=dtype)
+    h1 = tensor.clone().requires_grad_(True)
+    h2 = tensor.clone().requires_grad_(True)
+    grad = torch.randn_like(tensor)
+
+    reference = GroupedGemmaRMSNorm(hd, group_size).to(device=device, dtype=dtype)
+    triton = LigerRMSNorm(
+        hidden_size=hd,
+        offset=1.0,
+        casting_mode="gemma",
+        init_fn="zeros",
+        in_place=False,
+        group_size=group_size,
+    ).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        reference.weight.normal_()
+        triton.weight.copy_(reference.weight)
+
+    reference_output = reference(h1)
+    triton_output = triton(h2)
+    reference_output.backward(grad)
+    triton_output.backward(grad.clone())
+
+    assert_verbose_allclose(reference_output, triton_output, atol=atol, rtol=rtol)
+    assert_verbose_allclose(h1.grad, h2.grad, atol=atol, rtol=rtol)
+    assert_verbose_allclose(reference.weight.grad, triton.weight.grad, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        pytest.param(
+            torch.bfloat16,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+)
+def test_grouped_backward_fully_overwrites_empty_dx(monkeypatch, dtype):
+    shape = (17, 128)
+    n_groups = 4
+    tensor = torch.randn(shape, device=device, dtype=dtype)
+    weight = torch.randn(shape[-1], device=device, dtype=dtype)
+    grad = torch.randn_like(tensor)
+    forward = rms_norm_forward(tensor, weight, 1e-6, 1.0, "gemma", row_mode=None, n_groups=n_groups)
+    _, saved_x, rstd, block_size, num_warps, casting_mode = forward
+    backward_args = (
+        grad,
+        saved_x,
+        weight,
+        rstd,
+        1.0,
+        casting_mode,
+        block_size,
+        num_warps,
+        False,
+        None,
+        n_groups,
+    )
+    expected_dx, expected_dw = rms_norm_backward(*backward_args)
+
+    original_empty_like = torch.empty_like
+
+    def poisoned_empty_like(*args, **kwargs):
+        return original_empty_like(*args, **kwargs).fill_(torch.nan)
+
+    monkeypatch.setattr(torch, "empty_like", poisoned_empty_like)
+    actual_dx, actual_dw = rms_norm_backward(*backward_args)
+
+    assert not torch.isnan(actual_dx).any()
+    assert_verbose_allclose(actual_dx, expected_dx, atol=0.0, rtol=0.0)
+    assert_verbose_allclose(actual_dw, expected_dw, atol=0.0, rtol=0.0)
+
+
+def test_grouped_requires_elementwise_affine_weight():
+    with pytest.raises(ValueError, match="group_size requires elementwise_affine=True"):
+        LigerRMSNorm(hidden_size=128, group_size=32, elementwise_affine=False)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"group_size": 0}, "group_size must be a positive integer"),
+        ({"group_size": 24}, "hidden_size .* must be divisible"),
+    ],
+)
+def test_rms_norm_rejects_invalid_public_arguments(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        LigerRMSNorm(hidden_size=128, **kwargs)
+
+
+@pytest.mark.parametrize("n_groups", [0, -1, 1.5])
+def test_grouped_rejects_invalid_group_count(n_groups):
+    x = torch.randn(2, 128, device=device)
+    weight = torch.ones(128, device=device)
+    with pytest.raises(ValueError, match="n_groups must be a positive integer"):
+        LigerRMSNormFunction.apply(x, weight, 1e-6, 0.0, "gemma", False, None, n_groups)
 
 
 @pytest.mark.parametrize(

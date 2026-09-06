@@ -15,6 +15,7 @@ class LigerRMSNorm(nn.Module):
         in_place=True,
         row_mode=None,
         elementwise_affine=True,
+        group_size=None,
     ):
         super().__init__()
         assert init_fn in [
@@ -26,6 +27,14 @@ class LigerRMSNorm(nn.Module):
             self.weight = nn.Parameter(torch.ones(hidden_size) if init_fn == "ones" else torch.zeros(hidden_size))
         else:
             self.register_parameter("weight", None)
+        if group_size is not None:
+            if not isinstance(group_size, int) or group_size <= 0:
+                raise ValueError(f"group_size must be a positive integer, got {group_size}.")
+            if self.weight is None:
+                raise ValueError("group_size requires elementwise_affine=True.")
+            if hidden_size % group_size != 0:
+                raise ValueError(f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size}).")
+        self.group_size = group_size
         self.variance_epsilon, self.offset, self.casting_mode, self.in_place, self.row_mode = (
             eps,
             offset,
@@ -35,6 +44,27 @@ class LigerRMSNorm(nn.Module):
         )
 
     def forward(self, hidden_states):
+        group_size = getattr(self, "group_size", None)
+        weight = getattr(self, "weight", None)
+        n_groups = None
+        if group_size is not None:
+            if weight is None:
+                raise ValueError("group_size requires an elementwise-affine weight.")
+            if not isinstance(group_size, int) or group_size <= 0:
+                raise ValueError(f"group_size must be a positive integer, got {group_size}.")
+            if weight.numel() % group_size != 0:
+                raise ValueError(f"weight size ({weight.numel()}) must be divisible by group_size ({group_size}).")
+            n_groups = weight.numel() // group_size
+        if n_groups is None:
+            return LigerRMSNormFunction.apply(
+                hidden_states,
+                self.weight,
+                self.variance_epsilon,
+                self.offset,
+                self.casting_mode,
+                self.in_place,
+                self.row_mode,
+            )
         return LigerRMSNormFunction.apply(
             hidden_states,
             self.weight,
@@ -43,10 +73,15 @@ class LigerRMSNorm(nn.Module):
             self.casting_mode,
             self.in_place,
             self.row_mode,
+            n_groups,
         )
 
     def extra_repr(self):
-        return f"weight_shape={tuple(self.weight.shape) if self.weight is not None else None}, eps={self.variance_epsilon}, offset={self.offset}, in_place={self.in_place}, row_mode={self.row_mode}"
+        return (
+            f"weight_shape={tuple(self.weight.shape) if self.weight is not None else None}, "
+            f"eps={self.variance_epsilon}, offset={self.offset}, in_place={self.in_place}, "
+            f"row_mode={self.row_mode}, group_size={getattr(self, 'group_size', None)}"
+        )
 
 
 class LigerRMSNormForGemma(LigerRMSNorm):
