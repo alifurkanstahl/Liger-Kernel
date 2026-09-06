@@ -43,6 +43,31 @@ if device == "cuda":
 SLEEP_SECONDS = 0.1
 
 
+def test_ordinary_forward_preserves_historical_backend_function_abi(monkeypatch):
+    import liger_kernel.transformers.rms_norm as rms_norm_transformers
+
+    calls = []
+
+    class HistoricalBackendRMSNormFunction:
+        @staticmethod
+        def forward(ctx, X, W, eps, offset=0.0, casting_mode="llama", in_place=True, row_mode=None):
+            raise AssertionError("the test backend forward should only be reached through apply")
+
+        @staticmethod
+        def apply(X, W, eps, offset, casting_mode, in_place, row_mode):
+            calls.append((X, W, eps, offset, casting_mode, in_place, row_mode))
+            return X
+
+    monkeypatch.setattr(rms_norm_transformers, "LigerRMSNormFunction", HistoricalBackendRMSNormFunction)
+
+    module = LigerRMSNorm(8)
+    hidden_states = torch.randn(2, 8)
+
+    assert module(hidden_states) is hidden_states
+    assert len(calls) == 1
+    assert len(calls[0]) == 7
+
+
 class BaseRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True):
         super().__init__()
