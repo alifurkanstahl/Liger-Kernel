@@ -599,6 +599,72 @@ def _rms_group_norm_backward_kernel(
     tl.store(dW_ptr + pid * dW_row_stride + col_offsets, dW_row, mask=mask)
 
 
+@triton.jit
+def _rms_group_norm_backward_add_kernel(
+    dY0_ptr,
+    dY1_ptr,
+    dY2_ptr,
+    dY_row_stride,
+    dX_ptr,
+    dX_row_stride,
+    X_ptr,
+    X_row_stride,
+    X_dtype: tl.constexpr,
+    W_ptr,
+    RSTD_ptr,
+    RSTD_row_stride,
+    dW_ptr,
+    dW_row_stride,
+    n_rows,
+    n_groups: tl.constexpr,
+    n_cols,
+    offset,
+    rows_per_program,
+    casting_mode: tl.constexpr,
+    N_GRADIENTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Grouped RMSNorm backward with an in-register sum of two or three upstream gradients."""
+    pid = tl.program_id(0).to(tl.int64)
+    row_block_id = pid // n_groups
+    group_id = pid % n_groups
+
+    row_start = row_block_id * rows_per_program
+    row_end = min(row_start + rows_per_program, n_rows)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    dW_row = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    W_row = tl.load(W_ptr + group_id * n_cols + col_offsets, mask=mask, other=0.0)
+    W_row = W_row + tl.cast(offset, tl.float32)
+
+    for row_idx in range(row_start, row_end):
+        flat_row = row_idx * n_groups + group_id
+        dy_offsets = flat_row * dY_row_stride + col_offsets
+        dx_base = dX_ptr + flat_row * dX_row_stride
+        x_base = X_ptr + flat_row * X_row_stride
+        rstd_base = RSTD_ptr + flat_row * RSTD_row_stride
+
+        dY0_row = tl.load(dY0_ptr + dy_offsets, mask=mask, other=0.0)
+        dY_dtype = dY0_row.dtype
+        dY1_row = tl.load(dY1_ptr + dy_offsets, mask=mask, other=0.0)
+        # Sum in gradient dtype before Gemma-mode fp32 math. The two-gradient specialization avoids
+        # loading an autograd-materialized zero while preserving the order of the real additions.
+        dY_row = (dY0_row + dY1_row).to(dY_dtype)
+        if N_GRADIENTS == 3:
+            dY2_row = tl.load(dY2_ptr + dy_offsets, mask=mask, other=0.0)
+            dY_row = (dY_row + dY2_row).to(dY_dtype)
+        X_row = tl.load(x_base + col_offsets, mask=mask, other=0.0)
+        rstd_row = tl.load(rstd_base)
+        dX_row, dW_update = _rms_group_norm_backward_row(dY_row, X_row, W_row, rstd_row, n_cols, casting_mode, X_dtype)
+        dW_row += dW_update
+        tl.store(dx_base + col_offsets, dX_row, mask=mask)
+
+    # Every program owns one complete group slice, so a compact [program, group_size] buffer is
+    # sufficient for both this multi-gradient path and the generic grouped backward.
+    tl.store(dW_ptr + pid * dW_row_stride + col_offsets, dW_row, mask=mask)
+
+
 _str_to_casting_mode = {
     "llama": _CASTING_MODE_LLAMA.value,
     "gemma": _CASTING_MODE_GEMMA.value,
@@ -723,6 +789,107 @@ def rms_norm_forward(X, W, eps, offset, casting_mode, row_mode, n_groups=None):
                 **kernel_args,  # XPU-specific optimization
             )
     return Y.view(*shape), X, RSTD, BLOCK_SIZE, num_warps, casting_mode
+
+
+def rms_group_norm_backward_add3(
+    grad0,
+    grad1,
+    grad2,
+    X,
+    W,
+    RSTD,
+    offset,
+    casting_mode,
+    BLOCK_SIZE,
+    num_warps,
+    n_groups,
+    n_gradients=3,
+):
+    """Run grouped RMSNorm backward while summing BF16/FP16 gradients in registers."""
+    if n_gradients not in (2, 3):
+        raise ValueError(f"n_gradients must be 2 or 3, got {n_gradients}.")
+    if n_gradients == 3 and grad2 is None:
+        raise ValueError("grad2 must be provided when n_gradients=3.")
+    shape = grad0.shape
+    dim = shape[-1]
+    group_size = dim // n_groups
+    grad0 = grad0.view(-1, group_size)
+    grad1 = grad1.view(-1, group_size)
+    # Triton still requires a valid pointer for its compile-time-elided third input.
+    grad2 = grad1 if n_gradients == 2 else grad2
+    grad2 = grad2.view(-1, group_size)
+    n_rows, n_cols = grad0.shape
+    n_token_rows = n_rows // n_groups
+
+    sm_count = get_device_multiprocessor_count(X.device)
+
+    if n_cols > BLOCK_SIZE:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+    # The kernel writes every dX element and every compact partial-dW element, so neither output
+    # needs a zero-fill. Program order is [row_block, group], matching this reduction view.
+    dX = torch.empty_like(grad0)
+    partial_dW = torch.empty((sm_count * n_groups, group_size), dtype=torch.float32, device=W.device)
+    rows_per_program = math.ceil(n_token_rows / sm_count)
+
+    with device_context(X.device):
+        _rms_group_norm_backward_add_kernel[(sm_count * n_groups,)](
+            grad0,
+            grad1,
+            grad2,
+            grad0.stride(0),
+            dX,
+            dX.stride(0),
+            X,
+            X.stride(0),
+            torch_to_triton_dtype[X.dtype],
+            W,
+            RSTD,
+            RSTD.stride(0),
+            partial_dW,
+            partial_dW.stride(0),
+            n_token_rows,
+            n_groups,
+            n_cols,
+            offset,
+            rows_per_program,
+            casting_mode,
+            N_GRADIENTS=n_gradients,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+
+    dW = partial_dW.view(sm_count, n_groups, group_size).sum(dim=0).reshape(dim).to(W.dtype)
+    return dX.view(*shape), dW
+
+
+def rms_group_norm_backward_add2(
+    grad0,
+    grad1,
+    X,
+    W,
+    RSTD,
+    offset,
+    casting_mode,
+    BLOCK_SIZE,
+    num_warps,
+    n_groups,
+):
+    """Run grouped RMSNorm backward for exactly two real upstream gradients."""
+    return rms_group_norm_backward_add3(
+        grad0,
+        grad1,
+        None,
+        X,
+        W,
+        RSTD,
+        offset,
+        casting_mode,
+        BLOCK_SIZE,
+        num_warps,
+        n_groups,
+        n_gradients=2,
+    )
 
 
 def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warps, in_place, row_mode, n_groups=None):
