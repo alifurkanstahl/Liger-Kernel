@@ -27,7 +27,7 @@ def _qwen4_exp_ngram_hash_kernel(
     head_offsets,
     output,
     output_token_stride,
-    seq_len: tl.constexpr,
+    seq_len,
     context_len: tl.constexpr,
     eos_token_id: tl.constexpr,
     heads_per_ngram: tl.constexpr,
@@ -149,7 +149,7 @@ def qwen4_exp_ngram_hash(previous_context, input_ids, multipliers, vocab_sizes, 
             offsets,
             output,
             output.stride(-2),
-            seq_len=seq_len,
+            seq_len,
             context_len=previous_context.shape[1],
             eos_token_id=int(eos_token_id),
             heads_per_ngram=heads_per_ngram,
@@ -478,7 +478,7 @@ def _qwen4_exp_group_rms_norm_backward_write4(
     if n_cols > BLOCK_SIZE:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
-    dX = torch.empty_like(grad0)
+    dX = torch.empty_like(X)
     partial_dW = torch.empty((sm_count * n_groups, group_size), dtype=torch.float32, device=W.device)
     rows_per_program = math.ceil(n_token_rows / sm_count)
 

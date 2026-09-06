@@ -168,11 +168,11 @@ def _setup_qwen4_exp(input: SingleBenchmarkRunInput):
         else:
 
             def fwd_fn():
-                norm_down, norm_for_write, norm_pre = LigerGroupRMSNormFusedFunction.apply(
+                normalized = qwen4_exp_group_rms_norm_ref(
                     hyper_input, rms_weight, model.rms_norm_eps, 1.0, "gemma", hc_count
                 )
-                write_logits = torch.mm(norm_for_write, write_weight.transpose(0, 1)) / hc_count
-                return norm_down, norm_pre, write_logits
+                write_logits = torch.mm(normalized, write_weight.transpose(0, 1)) / hc_count
+                return normalized, normalized.view(normalized.shape), write_logits
 
         def backward_fn(outputs, retain_graph):
             torch.autograd.backward(outputs, grads, retain_graph=retain_graph)

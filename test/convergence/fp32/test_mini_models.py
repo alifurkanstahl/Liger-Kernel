@@ -24,6 +24,7 @@ from transformers.models.phi3 import Phi3ForCausalLM
 from transformers.models.qwen2 import Qwen2Config
 from transformers.models.qwen2 import Qwen2ForCausalLM
 
+from liger_kernel.ops.utils import is_hip
 from liger_kernel.transformers import apply_liger_kernel_to_deepseek_v4
 from liger_kernel.transformers import apply_liger_kernel_to_exaone4
 from liger_kernel.transformers import apply_liger_kernel_to_falcon_h1
@@ -1827,8 +1828,9 @@ def run_mini_model(
         assert all(layer.layer_type == "qwen_sparse_attention" for layer in model.model.layers)
         gated_residuals = [module for module in model.modules() if type(module).__name__ == "Qwen4ExpTextGatedResidual"]
         assert gated_residuals
+        uses_liger_gated_residual = bool(with_liger) and device == "cuda" and not is_hip()
         assert all(
-            (module.forward.__func__ is liger_qwen4_exp_gated_residual_forward) == bool(with_liger)
+            (module.forward.__func__ is liger_qwen4_exp_gated_residual_forward) == uses_liger_gated_residual
             for module in gated_residuals
         )
 
@@ -1844,10 +1846,9 @@ def run_mini_model(
         output = model(**batch)
         output.loss.backward()
         if model_name == "mini_qwen4_exp":
-            assert torch.isfinite(output.loss)
-            assert all(
-                parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in model.parameters()
-            )
+            finite = [torch.isfinite(output.loss).all()]
+            finite.extend(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+            assert torch.stack(finite).all()
         optimizer.step()
         print(f"Step {i}, Loss: {output.loss.item()}")
         loss_list.append(output.loss.item())

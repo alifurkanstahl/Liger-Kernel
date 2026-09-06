@@ -78,8 +78,19 @@ def _can_use_liger_hyper_connection(module, runtime_tensor):
 
 def _uses_liger_hyper_connection(module, runtime_tensor):
     current_forward = getattr(module.forward, "__func__", module.forward)
-    return current_forward is liger_qwen4_exp_gated_residual_forward and _can_use_liger_hyper_connection(
-        module, runtime_tensor
+    # Hooks must observe native injection weights, not the decoder's internal raw logits.
+    return (
+        current_forward is liger_qwen4_exp_gated_residual_forward
+        and not _has_module_hooks(module)
+        and _can_use_liger_hyper_connection(module, runtime_tensor)
+    )
+
+
+def _has_module_hooks(module):
+    return any(
+        getattr(module, f"_{hook_type}_hooks", None)
+        or getattr(torch.nn.modules.module, f"_global_{hook_type}_hooks", None)
+        for hook_type in ("forward_pre", "forward", "backward_pre", "backward")
     )
 
 
@@ -90,12 +101,7 @@ def _can_use_write4_linear(module):
         return False
     if hasattr(module, "_hf_hook") or hasattr(module, "_old_forward"):
         return False
-    if hasattr(module, "parametrizations") and len(module.parametrizations) != 0:
-        return False
-    if any(
-        getattr(module, hook_attribute, None)
-        for hook_attribute in ("_forward_pre_hooks", "_forward_hooks", "_backward_pre_hooks", "_backward_hooks")
-    ):
+    if _has_module_hooks(module):
         return False
     return type(module.weight) is torch.nn.Parameter and module.weight.layout == torch.strided
 
@@ -110,11 +116,8 @@ def _can_fuse_qwen4_exp_rms_norm(module):
         return False
     if hasattr(module, "parametrizations") and len(module.parametrizations) != 0:
         return False
-    for hook_type in ("forward_pre", "forward", "backward_pre", "backward"):
-        if getattr(module, f"_{hook_type}_hooks", None) or getattr(
-            torch.nn.modules.module, f"_global_{hook_type}_hooks", None
-        ):
-            return False
+    if _has_module_hooks(module):
+        return False
     weight = getattr(module, "weight", None)
     return type(weight) is torch.nn.Parameter and weight.layout == torch.strided
 
@@ -163,8 +166,8 @@ def liger_qwen4_exp_ngram_embedding_forward(self, input_ids, past_key_values):
         self.ngram_heads_offsets,
         self.eos_token_id,
     )
-    embedding_device = self.ngram_embedding.weight.device
-    return self.ngram_embedding(ngram_ids.to(embedding_device)).to(input_device).flatten(-2)
+    execution_device = self.ngram_embedding.weight.device if self.ngram_embedding.weight.device.type != "meta" else None
+    return self.ngram_embedding(ngram_ids.to(execution_device)).to(input_device).flatten(-2)
 
 
 def liger_qwen4_exp_gated_residual_forward(self, hyper_input, *, return_write_logits=False):
@@ -198,6 +201,11 @@ def liger_qwen4_exp_gated_residual_forward(self, hyper_input, *, return_write_lo
             dim=-2
         )
         if self.block_inject_weight is None:
+            if return_write_logits:
+                raise RuntimeError(
+                    "return_write_logits=True requires block_inject_weight "
+                    "(Qwen4Exp GatedResidual must use combine mode)."
+                )
             return mixed_input
         write_logits = self.block_inject_weight(hyper_input_normed) / self.hc_count
         if return_write_logits:
@@ -243,6 +251,10 @@ def liger_qwen4_exp_gated_residual_forward(self, hyper_input, *, return_write_lo
         self.hc_count,
     )
     if self.block_inject_weight is None:
+        if return_write_logits:
+            raise RuntimeError(
+                "return_write_logits=True requires block_inject_weight (Qwen4Exp GatedResidual must use combine mode)."
+            )
         return mixed_input
     if norm_for_write is not None:
         write_logits = self.block_inject_weight(norm_for_write) / self.hc_count
@@ -324,22 +336,29 @@ def liger_qwen4_exp_decoder_layer_forward(
     )
 
 
+def _patch_module_forward(module, native_attribute, liger_forward):
+    # Keep Accelerate's public pre/post-hook wrapper and replace only its inner callable.
+    forward_attribute = "_old_forward" if hasattr(module, "_hf_hook") and hasattr(module, "_old_forward") else "forward"
+    current_callable = getattr(module, forward_attribute)
+    current_forward = getattr(current_callable, "__func__", current_callable)
+    if current_forward is not liger_forward:
+        module.__dict__[native_attribute] = current_forward
+    setattr(module, forward_attribute, MethodType(liger_forward, module))
+
+
+def _patch_class_forward(module_class, native_attribute, liger_forward):
+    if module_class.forward is not liger_forward:
+        setattr(module_class, native_attribute, module_class.forward)
+    module_class.forward = liger_forward
+
+
 def patch_qwen4_exp_text_module_for_ngram(module, ngram_embedding_class):
     if isinstance(module, ngram_embedding_class):
-        forward_attribute = (
-            "_old_forward" if hasattr(module, "_hf_hook") and hasattr(module, "_old_forward") else "forward"
-        )
-        current_callable = getattr(module, forward_attribute)
-        current_forward = getattr(current_callable, "__func__", current_callable)
-        if current_forward is not liger_qwen4_exp_ngram_embedding_forward:
-            module.__dict__[_NATIVE_NGRAM_FORWARD_ATTR] = current_forward
-        setattr(module, forward_attribute, MethodType(liger_qwen4_exp_ngram_embedding_forward, module))
+        _patch_module_forward(module, _NATIVE_NGRAM_FORWARD_ATTR, liger_qwen4_exp_ngram_embedding_forward)
 
 
 def patch_qwen4_exp_text_ngram_class(ngram_embedding_class):
-    if ngram_embedding_class.forward is not liger_qwen4_exp_ngram_embedding_forward:
-        setattr(ngram_embedding_class, _NATIVE_NGRAM_FORWARD_ATTR, ngram_embedding_class.forward)
-    ngram_embedding_class.forward = liger_qwen4_exp_ngram_embedding_forward
+    _patch_class_forward(ngram_embedding_class, _NATIVE_NGRAM_FORWARD_ATTR, liger_qwen4_exp_ngram_embedding_forward)
 
 
 def patch_qwen4_exp_text_swiglu_classes(mlp_class, experts_class):
@@ -347,9 +366,7 @@ def patch_qwen4_exp_text_swiglu_classes(mlp_class, experts_class):
         (mlp_class, _NATIVE_MLP_FORWARD_ATTR, liger_qwen4_exp_mlp_forward),
         (experts_class, _NATIVE_EXPERTS_FORWARD_ATTR, liger_qwen4_exp_experts_forward),
     ):
-        if module_class.forward is not liger_forward:
-            setattr(module_class, native_attribute, module_class.forward)
-        module_class.forward = liger_forward
+        _patch_class_forward(module_class, native_attribute, liger_forward)
 
 
 def patch_qwen4_exp_text_module_for_swiglu(module, mlp_class, experts_class):
@@ -362,12 +379,7 @@ def patch_qwen4_exp_text_module_for_swiglu(module, mlp_class, experts_class):
     else:
         return
 
-    # As with the Qwen4Exp HyperConnection patch, keep Accelerate's public hook wrapper intact.
-    forward_attribute = "_old_forward" if hasattr(module, "_hf_hook") and hasattr(module, "_old_forward") else "forward"
-    current_forward = getattr(getattr(module, forward_attribute), "__func__", getattr(module, forward_attribute))
-    if current_forward is not liger_forward:
-        module.__dict__[native_attribute] = current_forward
-    setattr(module, forward_attribute, MethodType(liger_forward, module))
+    _patch_module_forward(module, native_attribute, liger_forward)
 
 
 def patch_qwen4_exp_text_hyper_connection_classes(gated_residual_class, decoder_layer_class):
@@ -379,9 +391,7 @@ def patch_qwen4_exp_text_hyper_connection_classes(gated_residual_class, decoder_
         ),
         (decoder_layer_class, _NATIVE_DECODER_FORWARD_ATTR, liger_qwen4_exp_decoder_layer_forward),
     ):
-        if module_class.forward is not liger_forward:
-            setattr(module_class, native_attribute, module_class.forward)
-        module_class.forward = liger_forward
+        _patch_class_forward(module_class, native_attribute, liger_forward)
 
 
 def patch_qwen4_exp_text_module_for_hyper_connection(module, gated_residual_class, decoder_layer_class):
@@ -394,10 +404,4 @@ def patch_qwen4_exp_text_module_for_hyper_connection(module, gated_residual_clas
     else:
         return
 
-    # Accelerate stores the wrapped callable in ``_old_forward`` and expects
-    # its public ``forward`` wrapper to remain installed so pre/post hooks run.
-    forward_attribute = "_old_forward" if hasattr(module, "_hf_hook") and hasattr(module, "_old_forward") else "forward"
-    current_forward = getattr(getattr(module, forward_attribute), "__func__", getattr(module, forward_attribute))
-    if current_forward is not liger_forward:
-        module.__dict__[native_attribute] = current_forward
-    setattr(module, forward_attribute, MethodType(liger_forward, module))
+    _patch_module_forward(module, native_attribute, liger_forward)

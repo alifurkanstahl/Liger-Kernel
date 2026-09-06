@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from test.utils import assert_verbose_allclose
+from test.utils import supports_bfloat16
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import MoeModelOutputWithPast
 
@@ -33,6 +34,7 @@ from liger_kernel.transformers.rms_norm import _liger_rms_norm_supports_grouped
 from liger_kernel.utils import infer_device
 
 device = infer_device()
+pytestmark = pytest.mark.usefixtures("qwen4_exp_globals")
 requires_nvidia = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="Qwen4Exp integration regression requires NVIDIA CUDA",
@@ -93,6 +95,8 @@ class RecordingTextModel(torch.nn.Module):
             dtype=torch.float32,
         ).reshape(batch_size, sequence_length, self.hidden_size)
         hidden = hidden.div(97).to(torch.float32)
+        if inputs_embeds is not None:
+            hidden = hidden + inputs_embeds
         router_logits = (
             torch.arange(
                 batch_size * sequence_length * self.num_experts,
@@ -140,26 +144,6 @@ def _assert_output_values_equal(actual, expected):
         assert actual == expected
 
 
-def _save_qwen4_globals(monkeypatch):
-    from transformers.models.qwen4_exp import modeling_qwen4_exp
-
-    class_names = ("Qwen4ExpTextRMSNorm",)
-    forward_names = (
-        "Qwen4ExpTextMLP",
-        "Qwen4ExpTextExperts",
-        "Qwen4ExpTextNGramEmbedding",
-        "Qwen4ExpTextGatedResidual",
-        "Qwen4ExpTextDecoderLayer",
-        "Qwen4ExpForCausalLM",
-    )
-    for name in class_names:
-        monkeypatch.setattr(modeling_qwen4_exp, name, getattr(modeling_qwen4_exp, name))
-    for name in forward_names:
-        module_class = getattr(modeling_qwen4_exp, name)
-        monkeypatch.setattr(module_class, "forward", module_class.forward)
-    return modeling_qwen4_exp
-
-
 @pytest.mark.parametrize("entrypoint", ["from_config", "from_pretrained"])
 def test_qwen4_exp_auto_liger_loads_composite_config_text_model(monkeypatch, tmp_path, entrypoint):
     from transformers import AutoModelForCausalLM
@@ -169,7 +153,6 @@ def test_qwen4_exp_auto_liger_loads_composite_config_text_model(monkeypatch, tmp
     from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
     from liger_kernel.transformers.rms_norm import LigerRMSNormForQwen4Exp
 
-    _save_qwen4_globals(monkeypatch)
     config = Qwen4ExpConfig(text_config=_tiny_config().to_dict())
     native = AutoModelForCausalLM.from_config(config)
     assert isinstance(native, Qwen4ExpForCausalLM)
@@ -190,7 +173,17 @@ def test_qwen4_exp_auto_liger_loads_composite_config_text_model(monkeypatch, tmp
 
 
 @requires_nvidia
-@pytest.mark.parametrize("return_write_logits", [False, True], ids=["grouped", "write4"])
+@pytest.mark.parametrize(
+    "return_write_logits",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+    ids=["grouped", "write4"],
+)
 @pytest.mark.parametrize("hook_type", ["forward_pre", "forward", "full_backward_pre", "full_backward"])
 @pytest.mark.parametrize("global_hook", [False, True], ids=["local", "global"])
 def test_qwen4_exp_grouped_fusion_preserves_norm_hooks(monkeypatch, return_write_logits, hook_type, global_hook):
@@ -273,7 +266,8 @@ def test_qwen4_exp_lce_signature_preserves_upstream_positional_prefix():
 
 @pytest.mark.parametrize("patch_globally", [False, True], ids=["instance", "global-before-construction"])
 def test_qwen4_exp_lce_positional_binding_matches_native(monkeypatch, patch_globally):
-    modeling_qwen4_exp = _save_qwen4_globals(monkeypatch)
+    from transformers.models.qwen4_exp import modeling_qwen4_exp
+
     native_forward = modeling_qwen4_exp.Qwen4ExpForCausalLM.forward
     config = _tiny_config()
     reference = _stub_causal_lm(config)
@@ -464,6 +458,7 @@ def test_qwen4_exp_ngram_preserves_accelerate_offload_wrapper(patch_first):
 
 
 @requires_nvidia
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
 @pytest.mark.parametrize("group_size", [None, 8], ids=["ordinary", "grouped"])
 @pytest.mark.parametrize("patch_first", [True, False], ids=["liger-then-accelerate", "accelerate-then-liger"])
 def test_qwen4_exp_rms_norm_preserves_accelerate_offload_wrapper(group_size, patch_first):
@@ -500,13 +495,13 @@ def test_qwen4_exp_rms_norm_preserves_accelerate_offload_wrapper(group_size, pat
 
 
 @requires_nvidia
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
 def test_qwen4_exp_grouped_rms_norm_native_policy_preserves_accelerate_wrapper(monkeypatch):
     accelerate_hooks = pytest.importorskip("accelerate.hooks")
     from transformers.models.qwen4_exp import modeling_qwen4_exp
 
     import liger_kernel.transformers.monkey_patch as monkey_patch_module
 
-    _save_qwen4_globals(monkeypatch)
     native_forward = modeling_qwen4_exp.Qwen4ExpTextRMSNorm.forward
     config = _tiny_config(ple=True)
     model = modeling_qwen4_exp.Qwen4ExpForCausalLM(config).to("cuda", torch.bfloat16)
@@ -573,7 +568,6 @@ def test_qwen4_exp_top_level_lce_preserves_accelerate_wrapper(patch_first):
         assert candidate.forward is accelerate_forward
 
     assert getattr(candidate._old_forward, "__func__", candidate._old_forward) is lce_forward
-    assert candidate.__dict__["_liger_qwen4_exp_native_causal_lm_forward"] is not accelerate_forward
     for _ in range(2):
         input_ids = torch.tensor([[1, 2, 3, 4]])
         expected = reference(input_ids, logits_to_keep=2)
@@ -647,6 +641,7 @@ def test_qwen4_exp_fused_lce_lm_head_eligibility_is_conservative():
 
 
 @requires_nvidia
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
 def test_qwen4_exp_write4_rejects_custom_linear_semantics(monkeypatch):
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
 
@@ -682,6 +677,7 @@ def test_qwen4_exp_write4_rejects_custom_linear_semantics(monkeypatch):
 
 
 @requires_nvidia
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
 def test_qwen4_exp_grouped_multi_gradient_backward_compiles_with_python_offset():
     x = torch.randn(2, 3, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -702,7 +698,8 @@ def test_qwen4_exp_grouped_multi_gradient_backward_compiles_with_python_offset()
 
 
 def test_qwen4_exp_global_and_instance_rms_norm_lifecycle_is_idempotent(monkeypatch):
-    modeling_qwen4_exp = _save_qwen4_globals(monkeypatch)
+    from transformers.models.qwen4_exp import modeling_qwen4_exp
+
     native_rms_norm_class = modeling_qwen4_exp.Qwen4ExpTextRMSNorm
     config = _tiny_config(ple=True)
     instance_then_global = modeling_qwen4_exp.Qwen4ExpForCausalLM(config)
@@ -766,3 +763,228 @@ def test_qwen4_exp_global_and_instance_rms_norm_lifecycle_is_idempotent(monkeypa
             assert all(module.forward.__func__ is LigerRMSNorm.forward for module in grouped)
         else:
             assert all(not getattr(module, "_liger_rms_norm_patched", False) for module in grouped)
+
+
+@requires_nvidia
+def test_qwen4_exp_ngram_child_offload_materializes_in_child_hook():
+    """Child-offloaded n-gram embedding must keep ids on CUDA and restore offload state."""
+    accelerate_hooks = pytest.importorskip("accelerate.hooks")
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
+
+    config = _tiny_config(ple=True)
+    reference = Qwen4ExpTextNGramEmbedding(config, config.ple_embed_dim, 0, 0).to("cuda")
+    candidate = copy.deepcopy(reference)
+    patch_qwen4_exp_text_module_for_ngram(candidate, Qwen4ExpTextNGramEmbedding)
+    child_weights_map = {
+        name: tensor.detach().cpu().clone() for name, tensor in candidate.ngram_embedding.state_dict().items()
+    }
+    accelerate_hooks.attach_align_device_hook(
+        candidate.ngram_embedding,
+        execution_device=torch.device("cuda", torch.cuda.current_device()),
+        offload=True,
+        weights_map=child_weights_map,
+    )
+
+    assert not hasattr(candidate, "_hf_hook")
+    assert hasattr(candidate.ngram_embedding, "_hf_hook")
+    assert candidate.ngram_embedding.weight.device.type == "meta"
+
+    seen_weight_devices = []
+    seen_input_devices = []
+
+    def record_pre(module, args):
+        seen_weight_devices.append(module.weight.device.type)
+        seen_input_devices.append(args[0].device.type)
+
+    pre_handle = candidate.ngram_embedding.register_forward_pre_hook(record_pre)
+    try:
+        reference_cache = DynamicCache(config=config)
+        candidate_cache = DynamicCache(config=config)
+        for input_ids in (torch.tensor([[11, 12]], device="cuda"), torch.tensor([[2, 21]], device="cuda")):
+            assert candidate.ngram_embedding.weight.device.type == "meta"
+            expected = reference(input_ids, reference_cache)
+            actual = candidate(input_ids, candidate_cache)
+            assert_verbose_allclose(actual, expected, atol=0.0, rtol=0.0)
+            assert torch.equal(reference_cache.layers[0].conv_states[2], candidate_cache.layers[0].conv_states[2])
+            assert candidate.ngram_embedding.weight.device.type == "meta"
+    finally:
+        pre_handle.remove()
+
+    assert seen_weight_devices
+    assert all(seen == "meta" for seen in seen_weight_devices)
+    assert all(device == "cuda" for device in seen_input_devices)
+
+
+@requires_nvidia
+@pytest.mark.parametrize("global_hook", [False, True], ids=["local", "global"])
+@pytest.mark.parametrize("hook_type", ["forward", "full_backward_pre", "full_backward"])
+def test_qwen4_exp_decoder_preserves_hyper_connection_hook_contract(monkeypatch, global_hook, hook_type):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
+
+    from liger_kernel.ops.qwen4_exp import LigerQwen4ExpGRWriteFunction
+    from liger_kernel.transformers.qwen4_exp import _uses_liger_hyper_connection
+    from liger_kernel.transformers.qwen4_exp import patch_qwen4_exp_text_module_for_hyper_connection
+
+    class Attention(torch.nn.Module):
+        def forward(self, hidden_states, position_embeddings, **kwargs):
+            return hidden_states * 0.5, None
+
+    config = _tiny_config()
+    reference = object.__new__(Qwen4ExpTextDecoderLayer)
+    torch.nn.Module.__init__(reference)
+    reference.ple = None
+    reference.layer_type = "full_attention"
+    reference.self_attn = Attention()
+    reference.mlp = torch.nn.Identity()
+    reference.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
+    reference.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
+    reference.cuda()
+    candidate = copy.deepcopy(reference)
+    for module in candidate.modules():
+        patch_qwen4_exp_text_module_for_hyper_connection(module, Qwen4ExpTextGatedResidual, Qwen4ExpTextDecoderLayer)
+    x = torch.randn(2, 3, config.hc_count * config.hidden_size, device="cuda", requires_grad=True)
+    candidate_x = x.detach().clone().requires_grad_(True)
+    assert _uses_liger_hyper_connection(candidate.attn_hyper_connection, x)
+    targets = [model.attn_hyper_connection for model in (reference, candidate)]
+    calls = [0, 0]
+
+    def hook(module, *args):
+        if module not in targets:
+            return None
+        calls[targets.index(module)] += 1
+        if hook_type == "forward":
+            mixed, residual, injection_weights = args[1]
+            return mixed, residual, torch.zeros_like(injection_weights)
+        return tuple(value * 0.5 if value is not None else None for value in args[0])
+
+    def reject_raw_logits(*args, **kwargs):
+        pytest.fail("Decoder used raw write logits despite HyperConnection hooks")
+
+    monkeypatch.setattr(LigerQwen4ExpGRWriteFunction, "apply", reject_raw_logits)
+    handles = (
+        [getattr(torch.nn.modules.module, f"register_module_{hook_type}_hook")(hook)]
+        if global_hook
+        else [getattr(module, f"register_{hook_type}_hook")(hook) for module in targets]
+    )
+    try:
+        position_embeddings = (torch.empty(0, device="cuda"),) * 2
+        expected = reference(x, position_embeddings)
+        actual = candidate(candidate_x, position_embeddings)
+        grad = torch.randn_like(expected)
+        expected.backward(grad)
+        actual.backward(grad)
+        assert calls == [1, 1]
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(candidate_x.grad, x.grad, atol=2e-5, rtol=2e-5)
+        for parameter, native_parameter in zip(candidate.parameters(), reference.parameters()):
+            torch.testing.assert_close(parameter.grad, native_parameter.grad, atol=2e-5, rtol=2e-5)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert _uses_liger_hyper_connection(candidate.attn_hyper_connection, x)
+
+
+@requires_nvidia
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
+@pytest.mark.parametrize("hook_type", ["forward_pre", "forward", "full_backward_pre", "full_backward"])
+def test_qwen4_exp_write4_declines_global_module_hooks(monkeypatch, hook_type):
+    """Global hooks must disable the Write4 direct-weight path and run through the module call."""
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
+
+    from liger_kernel.transformers.qwen4_exp import _can_use_write4_linear
+
+    torch.manual_seed(73)
+    config = _tiny_config()
+    native = Qwen4ExpTextGatedResidual(config, use_combine=True).to(device, torch.bfloat16)
+    candidate = copy.deepcopy(native)
+    _patch_rms_norm_module(candidate.hc_norm, offset=1.0, casting_mode="gemma", in_place=False)
+    candidate.forward = MethodType(liger_qwen4_exp_gated_residual_forward, candidate)
+    targets = (native.block_inject_weight, candidate.block_inject_weight)
+    calls = [0, 0]
+
+    def hook(module, *args):
+        if module not in targets:
+            return None
+        calls[targets.index(module)] += 1
+        if hook_type == "forward":
+            return args[1] * 2
+        return tuple(value * 0.5 if value is not None else None for value in args[0])
+
+    def reject_write4(*args, **kwargs):
+        pytest.fail("Write4 direct-weight path ran despite a global module hook")
+
+    monkeypatch.setattr(LigerGroupRMSNormWrite4Function, "apply", reject_write4)
+    assert _can_use_write4_linear(candidate.block_inject_weight)
+    handle = getattr(torch.nn.modules.module, f"register_module_{hook_type}_hook")(hook)
+    try:
+        assert not _can_use_write4_linear(candidate.block_inject_weight)
+        assert not _can_use_write4_linear(native.block_inject_weight)
+        x = torch.randn(2, 3, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+        candidate_x = x.detach().clone().requires_grad_(True)
+        expected = native(x)
+        actual = candidate(candidate_x, return_write_logits=True)
+        actual = (*actual[:2], 2 * torch.sigmoid(actual[2]))
+        grads = tuple(torch.randn_like(value) for value in expected)
+        torch.autograd.backward(expected, grads)
+        torch.autograd.backward(actual, grads)
+        assert calls == [1, 1]
+        tolerance = 2e-2
+        for output, reference in zip(actual, expected):
+            torch.testing.assert_close(output, reference, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(candidate_x.grad, x.grad, atol=tolerance, rtol=tolerance)
+        for parameter, reference in zip(candidate.parameters(), native.parameters()):
+            torch.testing.assert_close(parameter.grad, reference.grad, atol=tolerance, rtol=tolerance)
+    finally:
+        handle.remove()
+
+    assert _can_use_write4_linear(candidate.block_inject_weight)
+
+
+@pytest.mark.parametrize("hook_type", ["forward_pre", "forward", "full_backward_pre", "full_backward"])
+def test_qwen4_exp_fused_lce_declines_global_module_hooks(hook_type):
+    """Global hooks must disable the fused-LCE direct-weight path and run through lm_head."""
+    targets = []
+    calls = []
+
+    def hook(module, *args):
+        if module not in targets:
+            return None
+        calls[targets.index(module)] += 1
+        if hook_type == "forward":
+            return args[1] * 2
+        return tuple(value * 0.5 if value is not None else None for value in args[0])
+
+    config = _tiny_config()
+    reference = _stub_causal_lm(config)
+    candidate = _stub_causal_lm(copy.deepcopy(config))
+    reference.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    candidate.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    candidate.lm_head.load_state_dict(reference.lm_head.state_dict())
+    candidate.forward = MethodType(lce_forward, candidate)
+    targets.extend((reference.lm_head, candidate.lm_head))
+    calls.extend((0, 0))
+    hidden_states = torch.randn(2, 3, config.hidden_size)
+    assert _can_use_fused_lce_lm_head(candidate.lm_head, hidden_states)
+
+    handle = getattr(torch.nn.modules.module, f"register_module_{hook_type}_hook")(hook)
+    try:
+        assert not _can_use_fused_lce_lm_head(candidate.lm_head, hidden_states)
+        assert not _can_use_fused_lce_lm_head(reference.lm_head, hidden_states)
+        labels = torch.tensor([[2, 3, 4, 5]])
+        reference_input = torch.randn(1, 4, config.hidden_size, requires_grad=True)
+        candidate_input = reference_input.detach().clone().requires_grad_(True)
+        expected = reference(inputs_embeds=reference_input, labels=labels)
+        actual = candidate(inputs_embeds=candidate_input, labels=labels, skip_logits=True)
+        assert actual.logits is not None
+        _assert_output_values_equal(actual.logits, expected.logits)
+        _assert_output_values_equal(actual.loss, expected.loss)
+        expected.loss.backward()
+        actual.loss.backward()
+        torch.testing.assert_close(candidate_input.grad, reference_input.grad, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(candidate.lm_head.weight.grad, reference.lm_head.weight.grad, atol=0.0, rtol=0.0)
+        assert calls == [1, 1]
+    finally:
+        handle.remove()
+
+    assert _can_use_fused_lce_lm_head(candidate.lm_head, hidden_states)

@@ -317,14 +317,20 @@ def test_grouped_backward_fully_overwrites_empty_dx(monkeypatch, dtype):
     expected_dx, expected_dw = rms_norm_backward(*backward_args)
 
     original_empty_like = torch.empty_like
+    original_empty = torch.empty
 
     def poisoned_empty_like(*args, **kwargs):
         return original_empty_like(*args, **kwargs).fill_(torch.nan)
 
+    def poisoned_empty(*args, **kwargs):
+        return original_empty(*args, **kwargs).fill_(torch.nan)
+
     monkeypatch.setattr(torch, "empty_like", poisoned_empty_like)
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
     actual_dx, actual_dw = rms_norm_backward(*backward_args)
 
     assert not torch.isnan(actual_dx).any()
+    assert not torch.isnan(actual_dw).any()
     assert_verbose_allclose(actual_dx, expected_dx, atol=0.0, rtol=0.0)
     assert_verbose_allclose(actual_dw, expected_dw, atol=0.0, rtol=0.0)
 

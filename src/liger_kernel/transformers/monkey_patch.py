@@ -65,7 +65,6 @@ IS_TRANSFORMERS_V5_OR_LATER = version.parse(transformers.__version__) >= version
 
 _QWEN4_EXP_NATIVE_RMS_NORM_CLASSES = ()
 _QWEN4_EXP_NATIVE_RMS_NORM_FORWARD = None
-_QWEN4_EXP_NATIVE_CAUSAL_LM_FORWARD_ATTR = "_liger_qwen4_exp_native_causal_lm_forward"
 
 
 def _bind_method_to_module(module, method_name: str, new_method: Callable):
@@ -3341,7 +3340,8 @@ def apply_liger_kernel_to_qwen4_exp(
             "supported yet; load the text model via `AutoModelForCausalLM` instead."
         )
 
-    use_liger_swiglu = swiglu and (model is None or model.config.hidden_act in ("silu", "swish"))
+    config = None if model is None else model.config.get_text_config()
+    use_liger_swiglu = swiglu and (config is None or getattr(config, "hidden_act", None) in ("silu", "swish"))
     supports_grouped_rms_norm = _liger_rms_norm_supports_grouped()
     native_qwen4_exp_rms_norm_forward = _QWEN4_EXP_NATIVE_RMS_NORM_FORWARD
 
@@ -3385,21 +3385,8 @@ def apply_liger_kernel_to_qwen4_exp(
     if fused_linear_cross_entropy:
         if model is not None:
             if isinstance(model, Qwen4ExpForCausalLM):
-                forward_attribute = (
-                    "_old_forward" if hasattr(model, "_hf_hook") and hasattr(model, "_old_forward") else "forward"
-                )
-                current_callable = getattr(model, forward_attribute)
-                current_forward = getattr(current_callable, "__func__", current_callable)
-                if current_forward is not qwen4_exp_lce_forward:
-                    model.__dict__[_QWEN4_EXP_NATIVE_CAUSAL_LM_FORWARD_ATTR] = current_forward
-                setattr(model, forward_attribute, MethodType(qwen4_exp_lce_forward, model))
+                _bind_forward_to_module(model, qwen4_exp_lce_forward)
         else:
-            if modeling_qwen4_exp.Qwen4ExpForCausalLM.forward is not qwen4_exp_lce_forward:
-                setattr(
-                    modeling_qwen4_exp.Qwen4ExpForCausalLM,
-                    _QWEN4_EXP_NATIVE_CAUSAL_LM_FORWARD_ATTR,
-                    modeling_qwen4_exp.Qwen4ExpForCausalLM.forward,
-                )
             modeling_qwen4_exp.Qwen4ExpForCausalLM.forward = qwen4_exp_lce_forward
 
     if model is not None:

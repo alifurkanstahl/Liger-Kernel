@@ -9,6 +9,7 @@ from transformers.utils.generic import can_return_tuple
 from liger_kernel.transformers.model.loss_utils import LigerForCausalLMLoss
 from liger_kernel.transformers.model.loss_utils import unpack_cross_entropy_result
 from liger_kernel.transformers.model.output_classes import LigerMoeCausalLMOutputWithPast
+from liger_kernel.transformers.qwen4_exp import _has_module_hooks
 
 
 def _can_use_fused_lce_lm_head(lm_head, hidden_states):
@@ -19,12 +20,7 @@ def _can_use_fused_lce_lm_head(lm_head, hidden_states):
         return False
     if hasattr(lm_head, "_hf_hook") or hasattr(lm_head, "_old_forward"):
         return False
-    if hasattr(lm_head, "parametrizations") and len(lm_head.parametrizations) != 0:
-        return False
-    if any(
-        getattr(lm_head, hook_attribute, None)
-        for hook_attribute in ("_forward_pre_hooks", "_forward_hooks", "_backward_pre_hooks", "_backward_hooks")
-    ):
+    if _has_module_hooks(lm_head):
         return False
     weight = lm_head.weight
     return (

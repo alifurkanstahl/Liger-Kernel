@@ -452,6 +452,7 @@ def test_qwen4_exp_group_rms_norm_write4_sparse_consumers(monkeypatch, used_cons
 @pytest.mark.parametrize(
     "used_consumers", [(3,), (0, 3), (1, 3), (2, 3), (0, 1, 3), (0, 2, 3), (1, 2, 3), (0, 1, 2), (0, 1, 2, 3)]
 )
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
 def test_qwen4_exp_write4_residual_consumers(used_consumers):
     """An unused residual stays undefined; residual-only use leaves Parameter grads undefined."""
     set_seed(43)
@@ -499,6 +500,7 @@ def _qwen4_exp_residual_join_boundary(module, x, block, fuse_residual):
 
 @requires_qwen4_exp
 @pytest.mark.parametrize("rows,noncontiguous", [(512, False), (2048, False), (32, True)])
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
 def test_qwen4_exp_residual_join_full_boundary(rows, noncontiguous):
     """Protect original residual storage, exact full-boundary gradients, hooks and accumulation."""
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
@@ -567,6 +569,7 @@ def test_qwen4_exp_residual_join_full_boundary(rows, noncontiguous):
             assert torch.equal(value, expected)
 
 
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
 def test_qwen4_exp_residual_join_rounds_rms_gradient_before_add():
     """Cancellation must happen after BF16 rounding, not against the FP32 RMS result."""
     set_seed(45)
@@ -893,6 +896,22 @@ def test_qwen4_exp_gated_residual_raw_write_logits_reject_unsupported_placement(
     hyper_input = torch.randn(2, 3, config.hc_count * config.hidden_size)
 
     with pytest.raises(RuntimeError, match="decoder must fall back before requesting raw write logits"):
+        module(hyper_input, return_write_logits=True)
+
+
+@requires_qwen4_exp
+@pytest.mark.parametrize("hc_count", [3, 4], ids=["native-count", "grouped-fusion"])
+def test_qwen4_exp_gated_residual_raw_write_logits_requires_combine_mode(hc_count):
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
+
+    config = Qwen4ExpTextConfig(hidden_size=8, hc_count=hc_count, hc_lowrank=4, rms_norm_eps=1e-5)
+    module = Qwen4ExpTextGatedResidual(config, use_combine=False).to(device)
+    _patch_rms_norm_module(module.hc_norm, offset=1.0, casting_mode="gemma", in_place=False)
+    module.forward = MethodType(liger_qwen4_exp_gated_residual_forward, module)
+    hyper_input = torch.randn(2, 3, hc_count * config.hidden_size, device=device)
+
+    with pytest.raises(RuntimeError, match="return_write_logits=True requires block_inject_weight"):
         module(hyper_input, return_write_logits=True)
 
 
@@ -1310,14 +1329,10 @@ def test_qwen4_exp_hyper_connection_write4_gr_write_cuda_graph_forward_backward(
         assert_verbose_allclose(actual.grad, expected.grad, atol=0.0, rtol=0.0)
 
 
-@requires_qwen4_exp
-@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
-def test_qwen4_exp_liger_ngram_rms_ple_default_compile_fullgraph_smoke_forward_backward():
-    """Smoke-test the default-compiled fixed-shape Liger n-gram + RMS PLE boundary."""
+@pytest.fixture
+def qwen4_exp_ple_compile_case():
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
 
     set_seed(42)
     config = Qwen4ExpTextConfig(
@@ -1333,84 +1348,46 @@ def test_qwen4_exp_liger_ngram_rms_ple_default_compile_fullgraph_smoke_forward_b
         eos_token_id=2,
         rms_norm_eps=1e-5,
     )
-    compiled_module = Qwen4ExpTextPLELayer(config, layer_idx=0, ple_layer_index=0).to(device, torch.bfloat16)
+    module = Qwen4ExpTextPLELayer(config, layer_idx=0, ple_layer_index=0).to(device, torch.bfloat16)
     with torch.no_grad():
-        compiled_module.conv1d.weight.normal_(mean=0.0, std=0.05)
-    assert torch.count_nonzero(compiled_module.conv1d.weight).item() == compiled_module.conv1d.weight.numel()
-    for module in compiled_module.modules():
-        patch_qwen4_exp_text_module_for_ngram(module, Qwen4ExpTextNGramEmbedding)
-        if isinstance(module, Qwen4ExpTextRMSNorm):
-            _patch_rms_norm_module(module, offset=1.0, casting_mode="gemma", in_place=False)
-    assert compiled_module.forward.__func__ is Qwen4ExpTextPLELayer.forward
-    for module in compiled_module.modules():
-        if isinstance(module, Qwen4ExpTextRMSNorm):
-            assert module.forward.__func__ is LigerRMSNorm.forward
-
+        module.conv1d.weight.normal_(mean=0.0, std=0.05)
+    assert torch.count_nonzero(module.conv1d.weight).item() == module.conv1d.weight.numel()
     input_ids = torch.tensor([[11, 12, 2, 21, 22], [31, 2, 41, 42, 43]], device=device)
-    hidden_states = torch.randn(2, 5, 4 * config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
-    grad_output = torch.randn_like(hidden_states)
+    hidden = torch.randn(2, 5, 4 * config.hidden_size, device=device, dtype=torch.bfloat16).requires_grad_(True)
     torch.compiler.reset()
-    compiled = torch.compile(compiled_module, fullgraph=True, mode="reduce-overhead")
-    output = compiled(hidden_states, input_ids, past_key_values=None)
-    output.backward(grad_output)
-    assert torch.isfinite(output).all()
-    assert torch.isfinite(hidden_states.grad).all()
-    assert all(
-        parameter.grad is not None and torch.isfinite(parameter.grad).all()
-        for parameter in compiled_module.parameters()
-    )
-    torch.compiler.reset()
+    try:
+        yield module, input_ids, hidden, torch.randn_like(hidden)
+    finally:
+        torch.compiler.reset()
 
 
-@requires_qwen4_exp
-@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
-def test_qwen4_exp_liger_ngram_rms_ple_compile_fullgraph_eager_numerics_forward_backward():
-    """Compare native and Liger PLE under eager and eager-numerics fullgraph compilation."""
-    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+def _patch_qwen4_exp_ple(module):
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
 
-    set_seed(42)
-    config = Qwen4ExpTextConfig(
-        hidden_size=32,
-        hc_count=4,
-        ple_embed_dim=32,
-        ple_conv_kernel_size=2,
-        ple_layer_ids=[1],
-        ngram_size=2,
-        heads_per_ngram=2,
-        ngram_vocab_size_base=31,
-        make_ngram_vocab_size_divisible_by=128,
-        eos_token_id=2,
-        rms_norm_eps=1e-5,
-    )
-    native_module = Qwen4ExpTextPLELayer(config, layer_idx=0, ple_layer_index=0).to(device, torch.bfloat16)
-    with torch.no_grad():
-        native_module.conv1d.weight.normal_(mean=0.0, std=0.05)
-    assert torch.count_nonzero(native_module.conv1d.weight).item() == native_module.conv1d.weight.numel()
+    for child in module.modules():
+        patch_qwen4_exp_text_module_for_ngram(child, Qwen4ExpTextNGramEmbedding)
+        if isinstance(child, Qwen4ExpTextRMSNorm):
+            _patch_rms_norm_module(child, offset=1.0, casting_mode="gemma", in_place=False)
+            assert child.forward.__func__ is LigerRMSNorm.forward
+    assert module.forward.__func__ is Qwen4ExpTextPLELayer.forward
+
+
+@requires_qwen4_exp
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
+def test_qwen4_exp_liger_ngram_rms_ple_compile_fullgraph_eager_numerics_forward_backward(qwen4_exp_ple_compile_case):
+    """Compare native and Liger PLE under eager and eager-numerics fullgraph compilation."""
+    native_module, input_ids, native_input, grad_output = qwen4_exp_ple_compile_case
     reference_module = copy.deepcopy(native_module)
     native_compiled_module = copy.deepcopy(native_module)
     compiled_module = copy.deepcopy(native_module)
     for candidate in (reference_module, compiled_module):
-        for module in candidate.modules():
-            patch_qwen4_exp_text_module_for_ngram(module, Qwen4ExpTextNGramEmbedding)
-            if isinstance(module, Qwen4ExpTextRMSNorm):
-                _patch_rms_norm_module(module, offset=1.0, casting_mode="gemma", in_place=False)
-    assert native_module.forward.__func__ is Qwen4ExpTextPLELayer.forward
-    assert native_compiled_module.forward.__func__ is Qwen4ExpTextPLELayer.forward
-    assert reference_module.forward.__func__ is Qwen4ExpTextPLELayer.forward
-    assert compiled_module.forward.__func__ is Qwen4ExpTextPLELayer.forward
-    for module in (*reference_module.modules(), *compiled_module.modules()):
-        if isinstance(module, Qwen4ExpTextRMSNorm):
-            assert module.forward.__func__ is LigerRMSNorm.forward
+        _patch_qwen4_exp_ple(candidate)
 
-    input_ids = torch.tensor([[11, 12, 2, 21, 22], [31, 2, 41, 42, 43]], device=device)
-    native_input = torch.randn(2, 5, 4 * config.hidden_size, device=device, dtype=torch.bfloat16).requires_grad_(True)
     reference_input = native_input.detach().clone().requires_grad_(True)
     native_compiled_input = native_input.detach().clone().requires_grad_(True)
     compiled_input = reference_input.detach().clone().requires_grad_(True)
-    grad_output = torch.randn_like(reference_input)
     native = native_module(native_input, input_ids, past_key_values=None)
     native.backward(grad_output)
     reference = reference_module(reference_input, input_ids, past_key_values=None)
@@ -1475,40 +1452,13 @@ def test_qwen4_exp_liger_ngram_rms_ple_compile_fullgraph_eager_numerics_forward_
 
 @requires_qwen4_exp
 @pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
-def test_qwen4_exp_liger_ngram_rms_ple_default_compile_native_parity_forward_backward():
+def test_qwen4_exp_liger_ngram_rms_ple_default_compile_native_parity_forward_backward(qwen4_exp_ple_compile_case):
     """Compare native and Liger PLE under the default Inductor BF16 numerics."""
-    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
-
-    set_seed(42)
-    config = Qwen4ExpTextConfig(
-        hidden_size=32,
-        hc_count=4,
-        ple_embed_dim=32,
-        ple_conv_kernel_size=2,
-        ple_layer_ids=[1],
-        ngram_size=2,
-        heads_per_ngram=2,
-        ngram_vocab_size_base=31,
-        make_ngram_vocab_size_divisible_by=128,
-        eos_token_id=2,
-        rms_norm_eps=1e-5,
-    )
-    native_module = Qwen4ExpTextPLELayer(config, layer_idx=0, ple_layer_index=0).to(device, torch.bfloat16)
-    with torch.no_grad():
-        native_module.conv1d.weight.normal_(mean=0.0, std=0.05)
+    native_module, input_ids, native_input, grad_output = qwen4_exp_ple_compile_case
     liger_module = copy.deepcopy(native_module)
-    for module in liger_module.modules():
-        patch_qwen4_exp_text_module_for_ngram(module, Qwen4ExpTextNGramEmbedding)
-        if isinstance(module, Qwen4ExpTextRMSNorm):
-            _patch_rms_norm_module(module, offset=1.0, casting_mode="gemma", in_place=False)
+    _patch_qwen4_exp_ple(liger_module)
 
-    input_ids = torch.tensor([[11, 12, 2, 21, 22], [31, 2, 41, 42, 43]], device=device)
-    native_input = torch.randn(2, 5, 4 * config.hidden_size, device=device, dtype=torch.bfloat16).requires_grad_(True)
     liger_input = native_input.detach().clone().requires_grad_(True)
-    grad_output = torch.randn_like(native_input)
 
     torch.compiler.reset()
     native_compiled = torch.compile(native_module, fullgraph=True, mode="reduce-overhead")
@@ -1544,7 +1494,10 @@ def test_qwen4_exp_liger_ngram_rms_ple_default_compile_native_parity_forward_bac
     torch.compiler.reset()
 
 
-@pytest.mark.parametrize("shape, ngram_size, heads_per_ngram", [((2, 17), 2, 4), ((3, 11), 4, 3)])
+@pytest.mark.parametrize(
+    "shape, ngram_size, heads_per_ngram",
+    [((2, 17), 2, 4), ((3, 11), 4, 3), ((2, 65), 4, 3)],
+)
 def test_qwen4_exp_ngram_hash(shape, ngram_size, heads_per_ngram):
     set_seed(42)
     n_heads = (ngram_size - 1) * heads_per_ngram

@@ -1,4 +1,5 @@
 import copy
+import importlib
 import inspect
 import subprocess
 import sys
@@ -3453,323 +3454,303 @@ def test_apply_liger_kernel_to_instance_for_qwen3_next():
 
 
 @pytest.mark.skipif(not is_qwen4_exp_available(), reason="qwen4_exp module not available")
+@pytest.mark.usefixtures("qwen4_exp_globals")
 def test_apply_liger_kernel_to_instance_for_qwen4_exp():
-    # Ensure any monkey patching is cleaned up for subsequent tests
-    with patch("transformers.models.qwen4_exp.modeling_qwen4_exp"):
-        from transformers.models.qwen4_exp import modeling_qwen4_exp
-        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextModel
+    modeling_qwen4_exp = importlib.import_module("transformers.models.qwen4_exp.modeling_qwen4_exp")
+    Qwen4ExpTextModel = modeling_qwen4_exp.Qwen4ExpTextModel
 
-        from liger_kernel.transformers.model.qwen4_exp import lce_forward as qwen4_exp_lce_forward
-        from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen4_exp
-        from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_decoder_layer_forward
-        from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_experts_forward
-        from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_gated_residual_forward
-        from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_mlp_forward
-        from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_ngram_embedding_forward
-        from liger_kernel.transformers.swiglu import LigerExperts
-        from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
+    from liger_kernel.transformers.model.qwen4_exp import lce_forward as qwen4_exp_lce_forward
+    from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen4_exp
+    from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_decoder_layer_forward
+    from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_experts_forward
+    from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_gated_residual_forward
+    from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_mlp_forward
+    from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_ngram_embedding_forward
+    from liger_kernel.transformers.swiglu import LigerExperts
+    from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
 
-        # Instantiate a dummy model (tiny hybrid GatedDeltaNet + QSA + MoE config)
-        config = transformers.models.qwen4_exp.configuration_qwen4_exp.Qwen4ExpTextConfig(
-            dtype=torch.bfloat16,
-            rms_norm_eps=1e-5,
-            vocab_size=101,
-            hidden_size=32,
-            num_hidden_layers=2,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=32,
-            linear_conv_kernel_dim=4,
-            linear_key_head_dim=16,
-            linear_value_head_dim=16,
-            linear_num_key_heads=2,
-            linear_num_value_heads=4,
-            moe_intermediate_size=16,
-            shared_expert_intermediate_size=16,
-            num_experts_per_tok=1,
-            num_experts=4,
-            hc_count=4,
-            hc_lowrank=8,
-            indexer_n_heads=1,
-            indexer_kv_heads=1,
-            indexer_head_dim=32,
-            indexer_budget=8,
-            indexer_compress_ratio=2,
-            ple_layer_ids=[1],
-            ple_embed_dim=32,
-            ngram_size=2,
-            heads_per_ngram=2,
-            ngram_vocab_size_base=31,
-            make_ngram_vocab_size_divisible_by=128,
-            eos_token_id=2,
-            layer_types=["linear_attention", "qwen_sparse_attention"],
-            experts_implementation="eager",
-        )
-        dummy_model_instance = AutoModelForCausalLM.from_config(config)
+    # Instantiate a dummy model (tiny hybrid GatedDeltaNet + QSA + MoE config)
+    config = transformers.models.qwen4_exp.configuration_qwen4_exp.Qwen4ExpTextConfig(
+        dtype=torch.bfloat16,
+        rms_norm_eps=1e-5,
+        vocab_size=101,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_experts_per_tok=1,
+        num_experts=4,
+        hc_count=4,
+        hc_lowrank=8,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=32,
+        indexer_budget=8,
+        indexer_compress_ratio=2,
+        ple_layer_ids=[1],
+        ple_embed_dim=32,
+        ngram_size=2,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=128,
+        eos_token_id=2,
+        layer_types=["linear_attention", "qwen_sparse_attention"],
+        experts_implementation="eager",
+    )
+    dummy_model_instance = AutoModelForCausalLM.from_config(config)
 
-        # Reject unsupported (including multimodal composite) instances before any process-global
-        # Qwen4Exp text class is mutated.
-        original_classes = (
-            modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
-            modeling_qwen4_exp.Qwen4ExpTextMLP,
-            modeling_qwen4_exp.Qwen4ExpTextExperts,
-        )
-        original_for_causal_lm_forward = modeling_qwen4_exp.Qwen4ExpForCausalLM.forward
-        with pytest.raises(TypeError, match="Unsupported qwen4_exp model type"):
-            apply_liger_kernel_to_qwen4_exp(model=object())
-        assert (
-            modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
-            modeling_qwen4_exp.Qwen4ExpTextMLP,
-            modeling_qwen4_exp.Qwen4ExpTextExperts,
-        ) == original_classes
-        assert modeling_qwen4_exp.Qwen4ExpForCausalLM.forward is original_for_causal_lm_forward
+    # Reject unsupported (including multimodal composite) instances before any process-global
+    # Qwen4Exp text class is mutated.
+    original_classes = (
+        modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
+        modeling_qwen4_exp.Qwen4ExpTextMLP,
+        modeling_qwen4_exp.Qwen4ExpTextExperts,
+    )
+    original_for_causal_lm_forward = modeling_qwen4_exp.Qwen4ExpForCausalLM.forward
+    with pytest.raises(TypeError, match="Unsupported qwen4_exp model type"):
+        apply_liger_kernel_to_qwen4_exp(model=object())
+    assert (
+        modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
+        modeling_qwen4_exp.Qwen4ExpTextMLP,
+        modeling_qwen4_exp.Qwen4ExpTextExperts,
+    ) == original_classes
+    assert modeling_qwen4_exp.Qwen4ExpForCausalLM.forward is original_for_causal_lm_forward
 
-        with pytest.raises(ValueError, match="cannot both be True"):
-            apply_liger_kernel_to_qwen4_exp(cross_entropy=True, fused_linear_cross_entropy=True)
-        assert (
-            modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
-            modeling_qwen4_exp.Qwen4ExpTextMLP,
-            modeling_qwen4_exp.Qwen4ExpTextExperts,
-        ) == original_classes
+    with pytest.raises(ValueError, match="cannot both be True"):
+        apply_liger_kernel_to_qwen4_exp(cross_entropy=True, fused_linear_cross_entropy=True)
+    assert (
+        modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
+        modeling_qwen4_exp.Qwen4ExpTextMLP,
+        modeling_qwen4_exp.Qwen4ExpTextExperts,
+    ) == original_classes
 
-        unsupported_activation_config = copy.deepcopy(config)
-        unsupported_activation_config.hidden_act = "gelu"
-        unsupported_activation_config.output_gate_type = "silu"
-        unsupported_activation_model = AutoModelForCausalLM.from_config(unsupported_activation_config)
-        apply_liger_kernel_to_qwen4_exp(
-            fused_linear_cross_entropy=False,
-            rms_norm=False,
-            engram=False,
-            hyper_connection=False,
-            model=unsupported_activation_model,
-        )
-        assert (
-            modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
-            modeling_qwen4_exp.Qwen4ExpTextMLP,
-            modeling_qwen4_exp.Qwen4ExpTextExperts,
-        ) == original_classes
-        unsupported_mlp = unsupported_activation_model.model.layers[0].mlp
-        assert inspect.getsource(unsupported_mlp.shared_expert.forward) != inspect.getsource(
-            LigerQwen3MoeSwiGLUMLP.forward
-        )
-        assert inspect.getsource(unsupported_mlp.experts.forward) != inspect.getsource(LigerExperts.forward)
+    unsupported_activation_config = copy.deepcopy(config)
+    unsupported_activation_config.hidden_act = "gelu"
+    unsupported_activation_config.output_gate_type = "silu"
+    unsupported_activation_model = AutoModelForCausalLM.from_config(unsupported_activation_config)
+    apply_liger_kernel_to_qwen4_exp(
+        fused_linear_cross_entropy=False,
+        rms_norm=False,
+        engram=False,
+        hyper_connection=False,
+        model=unsupported_activation_model,
+    )
+    assert (
+        modeling_qwen4_exp.Qwen4ExpTextRMSNorm,
+        modeling_qwen4_exp.Qwen4ExpTextMLP,
+        modeling_qwen4_exp.Qwen4ExpTextExperts,
+    ) == original_classes
+    unsupported_mlp = unsupported_activation_model.model.layers[0].mlp
+    assert inspect.getsource(unsupported_mlp.shared_expert.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
+    assert inspect.getsource(unsupported_mlp.experts.forward) != inspect.getsource(LigerExperts.forward)
 
-        def all_rms_norms(model):
-            return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextRMSNorm"]
+    def all_rms_norms(model):
+        return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextRMSNorm"]
 
-        def all_mlps(model):
-            return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextMLP"]
+    def all_mlps(model):
+        return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextMLP"]
 
-        def all_experts(model):
-            return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextExperts"]
+    def all_experts(model):
+        return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextExperts"]
 
-        def all_ngram_embeddings(model):
-            return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextNGramEmbedding"]
+    def all_ngram_embeddings(model):
+        return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextNGramEmbedding"]
 
-        def all_ple_layers(model):
-            return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextPLELayer"]
+    def all_ple_layers(model):
+        return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextPLELayer"]
 
-        native_ple_forward = all_ple_layers(dummy_model_instance)[0].forward.__func__
-        native_ngram_forward = all_ngram_embeddings(dummy_model_instance)[0].forward.__func__
+    native_ple_forward = all_ple_layers(dummy_model_instance)[0].forward.__func__
+    native_ngram_forward = all_ngram_embeddings(dummy_model_instance)[0].forward.__func__
 
-        def all_gated_residuals(model):
-            return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextGatedResidual"]
+    def all_gated_residuals(model):
+        return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextGatedResidual"]
 
-        def all_decoder_layers(model):
-            return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextDecoderLayer"]
+    def all_decoder_layers(model):
+        return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextDecoderLayer"]
 
-        def all_attention_modules(model):
-            return [
-                m for m in model.modules() if type(m).__name__ in ("Qwen4ExpTextGatedDeltaNet", "Qwen4ExpTextAttention")
-            ]
+    def all_attention_modules(model):
+        return [
+            m for m in model.modules() if type(m).__name__ in ("Qwen4ExpTextGatedDeltaNet", "Qwen4ExpTextAttention")
+        ]
 
-        # Explicitly disabled kernels must leave an existing model instance unchanged.
-        disabled_model_instance = AutoModelForCausalLM.from_config(config)
-        _apply_liger_kernel_to_instance(
-            model=disabled_model_instance,
-            fused_linear_cross_entropy=False,
-            rms_norm=False,
-            swiglu=False,
-            engram=False,
-            hyper_connection=False,
-        )
-        assert inspect.getsource(disabled_model_instance.forward) != inspect.getsource(qwen4_exp_lce_forward)
-        for norm in all_rms_norms(disabled_model_instance):
-            assert inspect.getsource(norm.forward) != inspect.getsource(LigerRMSNorm.forward)
-            assert not getattr(norm, "_liger_rms_norm_patched", False)
-        for mlp in all_mlps(disabled_model_instance):
-            assert inspect.getsource(mlp.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
-        for experts in all_experts(disabled_model_instance):
-            assert inspect.getsource(experts.forward) != inspect.getsource(LigerExperts.forward)
-        for ngram_embedding in all_ngram_embeddings(disabled_model_instance):
-            assert inspect.getsource(ngram_embedding.forward) != inspect.getsource(
-                liger_qwen4_exp_ngram_embedding_forward
-            )
-        for ple in all_ple_layers(disabled_model_instance):
-            assert ple.forward.__func__ is native_ple_forward
-        for gated_residual in all_gated_residuals(disabled_model_instance):
-            assert inspect.getsource(gated_residual.forward) != inspect.getsource(
-                liger_qwen4_exp_gated_residual_forward
-            )
-        for decoder_layer in all_decoder_layers(disabled_model_instance):
-            assert inspect.getsource(decoder_layer.forward) != inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
+    # Explicitly disabled kernels must leave an existing model instance unchanged.
+    disabled_model_instance = AutoModelForCausalLM.from_config(config)
+    _apply_liger_kernel_to_instance(
+        model=disabled_model_instance,
+        fused_linear_cross_entropy=False,
+        rms_norm=False,
+        swiglu=False,
+        engram=False,
+        hyper_connection=False,
+    )
+    assert inspect.getsource(disabled_model_instance.forward) != inspect.getsource(qwen4_exp_lce_forward)
+    for norm in all_rms_norms(disabled_model_instance):
+        assert inspect.getsource(norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+        assert not getattr(norm, "_liger_rms_norm_patched", False)
+    for mlp in all_mlps(disabled_model_instance):
+        assert inspect.getsource(mlp.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
+    for experts in all_experts(disabled_model_instance):
+        assert inspect.getsource(experts.forward) != inspect.getsource(LigerExperts.forward)
+    for ngram_embedding in all_ngram_embeddings(disabled_model_instance):
+        assert inspect.getsource(ngram_embedding.forward) != inspect.getsource(liger_qwen4_exp_ngram_embedding_forward)
+    for ple in all_ple_layers(disabled_model_instance):
+        assert ple.forward.__func__ is native_ple_forward
+    for gated_residual in all_gated_residuals(disabled_model_instance):
+        assert inspect.getsource(gated_residual.forward) != inspect.getsource(liger_qwen4_exp_gated_residual_forward)
+    for decoder_layer in all_decoder_layers(disabled_model_instance):
+        assert inspect.getsource(decoder_layer.forward) != inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
 
-        assert len(all_rms_norms(dummy_model_instance)) > 0
-        assert len(all_mlps(dummy_model_instance)) > 0
-        assert len(all_experts(dummy_model_instance)) > 0
-        assert len(all_ngram_embeddings(dummy_model_instance)) > 0
-        assert len(all_ple_layers(dummy_model_instance)) > 0
-        assert len(all_gated_residuals(dummy_model_instance)) > 0
-        assert len(all_decoder_layers(dummy_model_instance)) > 0
-        assert {type(module).__name__ for module in all_attention_modules(dummy_model_instance)} == {
-            "Qwen4ExpTextGatedDeltaNet",
-            "Qwen4ExpTextAttention",
-        }
-        attention_forward_sources = {
-            id(module): inspect.getsource(module.forward) for module in all_attention_modules(dummy_model_instance)
-        }
-        native_state = {name: tensor.clone() for name, tensor in dummy_model_instance.state_dict().items()}
-        native_norm_paths = {
-            name
-            for name, module in dummy_model_instance.named_modules()
-            if type(module).__name__ == "Qwen4ExpTextRMSNorm"
-        }
-        assert native_norm_paths == {
-            "model.layers.0.ple.norm_key",
-            "model.layers.0.ple.norm_query",
-            "model.layers.0.ple.norm_conv",
-            "model.layers.0.attn_hyper_connection.hc_norm",
-            "model.layers.0.mlp_hyper_connection.hc_norm",
-            "model.layers.1.self_attn.q_norm",
-            "model.layers.1.self_attn.k_norm",
-            "model.layers.1.self_attn.indexer.q_layernorm",
-            "model.layers.1.self_attn.indexer.k_layernorm",
-            "model.layers.1.attn_hyper_connection.hc_norm",
-            "model.layers.1.mlp_hyper_connection.hc_norm",
-            "model.hyper_connection_mixer.hc_norm",
-        }
-        native_unpatched_rms_paths = {
-            name: inspect.getsource(module.forward)
-            for name, module in dummy_model_instance.named_modules()
-            if type(module).__name__ == "Qwen4ExpTextRMSNormGated"
-        }
-        assert native_unpatched_rms_paths.keys() == {"model.layers.0.linear_attn.norm"}
+    assert len(all_rms_norms(dummy_model_instance)) > 0
+    assert len(all_mlps(dummy_model_instance)) > 0
+    assert len(all_experts(dummy_model_instance)) > 0
+    assert len(all_ngram_embeddings(dummy_model_instance)) > 0
+    assert len(all_ple_layers(dummy_model_instance)) > 0
+    assert len(all_gated_residuals(dummy_model_instance)) > 0
+    assert len(all_decoder_layers(dummy_model_instance)) > 0
+    assert {type(module).__name__ for module in all_attention_modules(dummy_model_instance)} == {
+        "Qwen4ExpTextGatedDeltaNet",
+        "Qwen4ExpTextAttention",
+    }
+    attention_forward_sources = {
+        id(module): inspect.getsource(module.forward) for module in all_attention_modules(dummy_model_instance)
+    }
+    native_state = {name: tensor.clone() for name, tensor in dummy_model_instance.state_dict().items()}
+    native_norm_paths = {
+        name for name, module in dummy_model_instance.named_modules() if type(module).__name__ == "Qwen4ExpTextRMSNorm"
+    }
+    assert native_norm_paths == {
+        "model.layers.0.ple.norm_key",
+        "model.layers.0.ple.norm_query",
+        "model.layers.0.ple.norm_conv",
+        "model.layers.0.attn_hyper_connection.hc_norm",
+        "model.layers.0.mlp_hyper_connection.hc_norm",
+        "model.layers.1.self_attn.q_norm",
+        "model.layers.1.self_attn.k_norm",
+        "model.layers.1.self_attn.indexer.q_layernorm",
+        "model.layers.1.self_attn.indexer.k_layernorm",
+        "model.layers.1.attn_hyper_connection.hc_norm",
+        "model.layers.1.mlp_hyper_connection.hc_norm",
+        "model.hyper_connection_mixer.hc_norm",
+    }
+    native_unpatched_rms_paths = {
+        name: inspect.getsource(module.forward)
+        for name, module in dummy_model_instance.named_modules()
+        if type(module).__name__ == "Qwen4ExpTextRMSNormGated"
+    }
+    assert native_unpatched_rms_paths.keys() == {"model.layers.0.linear_attn.norm"}
 
-        native_state_keys = set(native_state)
-        assert {
-            "model.layers.0.ple.ple_embedding.layer_multipliers",
-            "model.layers.0.ple.ple_embedding.ngram_heads_vocab_sizes",
-            "model.layers.0.ple.ple_embedding.ngram_heads_offsets",
-        } <= native_state_keys
-        assert any(".ple." in name for name in native_state_keys)
-        assert any("_hyper_connection." in name for name in native_state_keys)
-        assert all(f"{name}.weight" in native_state_keys for name in native_norm_paths)
+    native_state_keys = set(native_state)
+    assert {
+        "model.layers.0.ple.ple_embedding.layer_multipliers",
+        "model.layers.0.ple.ple_embedding.ngram_heads_vocab_sizes",
+        "model.layers.0.ple.ple_embedding.ngram_heads_offsets",
+    } <= native_state_keys
+    assert any(".ple." in name for name in native_state_keys)
+    assert any("_hyper_connection." in name for name in native_state_keys)
+    assert all(f"{name}.weight" in native_state_keys for name in native_norm_paths)
 
-        # Check that model instance variables are not yet patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen4_exp_lce_forward)
-        for norm in all_rms_norms(dummy_model_instance):
-            assert inspect.getsource(norm.forward) != inspect.getsource(LigerRMSNorm.forward)
-        for mlp in all_mlps(dummy_model_instance):
-            assert inspect.getsource(mlp.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
-        for experts in all_experts(dummy_model_instance):
-            assert inspect.getsource(experts.forward) != inspect.getsource(LigerExperts.forward)
-        for ngram_embedding in all_ngram_embeddings(dummy_model_instance):
-            assert inspect.getsource(ngram_embedding.forward) != inspect.getsource(
-                liger_qwen4_exp_ngram_embedding_forward
-            )
-        for ple in all_ple_layers(dummy_model_instance):
-            assert ple.forward.__func__ is native_ple_forward
-        for gated_residual in all_gated_residuals(dummy_model_instance):
-            assert inspect.getsource(gated_residual.forward) != inspect.getsource(
-                liger_qwen4_exp_gated_residual_forward
-            )
-        for decoder_layer in all_decoder_layers(dummy_model_instance):
-            assert inspect.getsource(decoder_layer.forward) != inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
+    # Check that model instance variables are not yet patched with Liger modules
+    assert inspect.getsource(dummy_model_instance.forward) != inspect.getsource(qwen4_exp_lce_forward)
+    for norm in all_rms_norms(dummy_model_instance):
+        assert inspect.getsource(norm.forward) != inspect.getsource(LigerRMSNorm.forward)
+    for mlp in all_mlps(dummy_model_instance):
+        assert inspect.getsource(mlp.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
+    for experts in all_experts(dummy_model_instance):
+        assert inspect.getsource(experts.forward) != inspect.getsource(LigerExperts.forward)
+    for ngram_embedding in all_ngram_embeddings(dummy_model_instance):
+        assert inspect.getsource(ngram_embedding.forward) != inspect.getsource(liger_qwen4_exp_ngram_embedding_forward)
+    for ple in all_ple_layers(dummy_model_instance):
+        assert ple.forward.__func__ is native_ple_forward
+    for gated_residual in all_gated_residuals(dummy_model_instance):
+        assert inspect.getsource(gated_residual.forward) != inspect.getsource(liger_qwen4_exp_gated_residual_forward)
+    for decoder_layer in all_decoder_layers(dummy_model_instance):
+        assert inspect.getsource(decoder_layer.forward) != inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
 
-        # Test applying kernels to the model instance (auto-detected from model_type qwen4_exp_text)
-        _apply_liger_kernel_to_instance(model=dummy_model_instance)
+    # Test applying kernels to the model instance (auto-detected from model_type qwen4_exp_text)
+    _apply_liger_kernel_to_instance(model=dummy_model_instance)
 
-        # Check that the model's instance variables were correctly patched with Liger modules
-        assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen4_exp_lce_forward)
-        for norm in all_rms_norms(dummy_model_instance):
-            assert inspect.getsource(norm.forward) == inspect.getsource(LigerRMSNorm.forward)
-            assert norm._liger_rms_norm_patched is True
-            assert norm.eps == norm.variance_epsilon == config.rms_norm_eps
-            assert norm.casting_mode == "gemma"
-            assert norm.offset == 1.0
-            assert norm.in_place is False
-        for mlp in all_mlps(dummy_model_instance):
-            assert inspect.getsource(mlp.forward) == inspect.getsource(liger_qwen4_exp_mlp_forward)
-        for experts in all_experts(dummy_model_instance):
-            assert inspect.getsource(experts.forward) == inspect.getsource(liger_qwen4_exp_experts_forward)
-        for ngram_embedding in all_ngram_embeddings(dummy_model_instance):
-            assert inspect.getsource(ngram_embedding.forward) == inspect.getsource(
-                liger_qwen4_exp_ngram_embedding_forward
-            )
-            input_ids = torch.tensor([[11, 12, 2, 21]], dtype=torch.long)
-            expected = native_ngram_forward(ngram_embedding, input_ids, None)
-            assert torch.equal(ngram_embedding(input_ids, None), expected)
-        for ple in all_ple_layers(dummy_model_instance):
-            assert ple.forward.__func__ is native_ple_forward
-        for gated_residual in all_gated_residuals(dummy_model_instance):
-            assert inspect.getsource(gated_residual.forward) == inspect.getsource(
-                liger_qwen4_exp_gated_residual_forward
-            )
-        for decoder_layer in all_decoder_layers(dummy_model_instance):
-            assert inspect.getsource(decoder_layer.forward) == inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
-        for attention_module in all_attention_modules(dummy_model_instance):
-            assert inspect.getsource(attention_module.forward) == attention_forward_sources[id(attention_module)]
+    # Check that the model's instance variables were correctly patched with Liger modules
+    assert inspect.getsource(dummy_model_instance.forward) == inspect.getsource(qwen4_exp_lce_forward)
+    for norm in all_rms_norms(dummy_model_instance):
+        assert inspect.getsource(norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+        assert norm._liger_rms_norm_patched is True
+        assert norm.eps == norm.variance_epsilon == config.rms_norm_eps
+        assert norm.casting_mode == "gemma"
+        assert norm.offset == 1.0
+        assert norm.in_place is False
+    for mlp in all_mlps(dummy_model_instance):
+        assert inspect.getsource(mlp.forward) == inspect.getsource(liger_qwen4_exp_mlp_forward)
+    for experts in all_experts(dummy_model_instance):
+        assert inspect.getsource(experts.forward) == inspect.getsource(liger_qwen4_exp_experts_forward)
+    for ngram_embedding in all_ngram_embeddings(dummy_model_instance):
+        assert inspect.getsource(ngram_embedding.forward) == inspect.getsource(liger_qwen4_exp_ngram_embedding_forward)
+        input_ids = torch.tensor([[11, 12, 2, 21]], dtype=torch.long)
+        expected = native_ngram_forward(ngram_embedding, input_ids, None)
+        assert torch.equal(ngram_embedding(input_ids, None), expected)
+    for ple in all_ple_layers(dummy_model_instance):
+        assert ple.forward.__func__ is native_ple_forward
+    for gated_residual in all_gated_residuals(dummy_model_instance):
+        assert inspect.getsource(gated_residual.forward) == inspect.getsource(liger_qwen4_exp_gated_residual_forward)
+    for decoder_layer in all_decoder_layers(dummy_model_instance):
+        assert inspect.getsource(decoder_layer.forward) == inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
+    for attention_module in all_attention_modules(dummy_model_instance):
+        assert inspect.getsource(attention_module.forward) == attention_forward_sources[id(attention_module)]
 
-        patched_state = dummy_model_instance.state_dict()
-        assert patched_state.keys() == native_state.keys()
-        for name, tensor in patched_state.items():
-            assert torch.equal(tensor, native_state[name]), f"patch changed state for {name}"
-        patched_modules = dict(dummy_model_instance.named_modules())
-        assert all(
-            inspect.getsource(patched_modules[name].forward) == inspect.getsource(LigerRMSNorm.forward)
-            for name in native_norm_paths
-        )
-        assert all(
-            inspect.getsource(patched_modules[name].forward) == source
-            for name, source in native_unpatched_rms_paths.items()
-        )
+    patched_state = dummy_model_instance.state_dict()
+    assert patched_state.keys() == native_state.keys()
+    for name, tensor in patched_state.items():
+        assert torch.equal(tensor, native_state[name]), f"patch changed state for {name}"
+    patched_modules = dict(dummy_model_instance.named_modules())
+    assert all(
+        inspect.getsource(patched_modules[name].forward) == inspect.getsource(LigerRMSNorm.forward)
+        for name in native_norm_paths
+    )
+    assert all(
+        inspect.getsource(patched_modules[name].forward) == source
+        for name, source in native_unpatched_rms_paths.items()
+    )
 
-        # The grouped RMSNorm variant used by Gated Residual hyper-connections must keep its group size
-        grouped_norms = [m for m in all_rms_norms(dummy_model_instance) if getattr(m, "group_size", None)]
-        assert len(grouped_norms) > 0
+    # The grouped RMSNorm variant used by Gated Residual hyper-connections must keep its group size
+    grouped_norms = [m for m in all_rms_norms(dummy_model_instance) if getattr(m, "group_size", None)]
+    assert len(grouped_norms) > 0
 
-        try:
-            print(dummy_model_instance)
-        except Exception as e:
-            pytest.fail(f"An exception occured in extra_expr: {type(e).__name__} - {e}")
+    try:
+        print(dummy_model_instance)
+    except Exception as e:
+        pytest.fail(f"An exception occured in extra_expr: {type(e).__name__} - {e}")
 
-        # The base text model has no LM head. Default patching must skip fused LCE while still
-        # applying all text-stack kernels instead of rejecting the supported model type.
-        text_model_instance = Qwen4ExpTextModel(config)
-        _apply_liger_kernel_to_instance(model=text_model_instance)
-        assert inspect.getsource(text_model_instance.forward) != inspect.getsource(qwen4_exp_lce_forward)
-        for norm in all_rms_norms(text_model_instance):
-            assert inspect.getsource(norm.forward) == inspect.getsource(LigerRMSNorm.forward)
-        for mlp in all_mlps(text_model_instance):
-            assert inspect.getsource(mlp.forward) == inspect.getsource(liger_qwen4_exp_mlp_forward)
-        for experts in all_experts(text_model_instance):
-            assert inspect.getsource(experts.forward) == inspect.getsource(liger_qwen4_exp_experts_forward)
-        for ngram_embedding in all_ngram_embeddings(text_model_instance):
-            assert inspect.getsource(ngram_embedding.forward) == inspect.getsource(
-                liger_qwen4_exp_ngram_embedding_forward
-            )
-        for ple in all_ple_layers(text_model_instance):
-            assert ple.forward.__func__ is native_ple_forward
-        for gated_residual in all_gated_residuals(text_model_instance):
-            assert inspect.getsource(gated_residual.forward) == inspect.getsource(
-                liger_qwen4_exp_gated_residual_forward
-            )
-        for decoder_layer in all_decoder_layers(text_model_instance):
-            assert inspect.getsource(decoder_layer.forward) == inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
+    # The base text model has no LM head. Default patching must skip fused LCE while still
+    # applying all text-stack kernels instead of rejecting the supported model type.
+    text_model_instance = Qwen4ExpTextModel(config)
+    _apply_liger_kernel_to_instance(model=text_model_instance)
+    assert inspect.getsource(text_model_instance.forward) != inspect.getsource(qwen4_exp_lce_forward)
+    for norm in all_rms_norms(text_model_instance):
+        assert inspect.getsource(norm.forward) == inspect.getsource(LigerRMSNorm.forward)
+    for mlp in all_mlps(text_model_instance):
+        assert inspect.getsource(mlp.forward) == inspect.getsource(liger_qwen4_exp_mlp_forward)
+    for experts in all_experts(text_model_instance):
+        assert inspect.getsource(experts.forward) == inspect.getsource(liger_qwen4_exp_experts_forward)
+    for ngram_embedding in all_ngram_embeddings(text_model_instance):
+        assert inspect.getsource(ngram_embedding.forward) == inspect.getsource(liger_qwen4_exp_ngram_embedding_forward)
+    for ple in all_ple_layers(text_model_instance):
+        assert ple.forward.__func__ is native_ple_forward
+    for gated_residual in all_gated_residuals(text_model_instance):
+        assert inspect.getsource(gated_residual.forward) == inspect.getsource(liger_qwen4_exp_gated_residual_forward)
+    for decoder_layer in all_decoder_layers(text_model_instance):
+        assert inspect.getsource(decoder_layer.forward) == inspect.getsource(liger_qwen4_exp_decoder_layer_forward)
 
 
 @pytest.mark.skipif(not is_qwen4_exp_available(), reason="qwen4_exp module not available")
 @pytest.mark.parametrize("patch_before_construction", [False, True], ids=["instance", "global"])
+@pytest.mark.usefixtures("qwen4_exp_globals")
 def test_qwen4_exp_grouped_rms_norm_falls_back_for_historical_backend_abi(monkeypatch, patch_before_construction):
     from transformers.models.qwen4_exp import modeling_qwen4_exp
 
@@ -3780,16 +3761,6 @@ def test_qwen4_exp_grouped_rms_norm_falls_back_for_historical_backend_abi(monkey
 
     native_rms_norm_class = modeling_qwen4_exp.Qwen4ExpTextRMSNorm
     native_rms_norm_forward = native_rms_norm_class.forward
-    patched_class_attributes = (
-        "_liger_qwen4_exp_native_rms_norm_forward",
-        "offset",
-        "casting_mode",
-        "in_place",
-        "row_mode",
-        "_liger_rms_norm_supports_grouped",
-    )
-    saved_class_attributes = {name: native_rms_norm_class.__dict__.get(name) for name in patched_class_attributes}
-    had_class_attributes = {name: name in native_rms_norm_class.__dict__ for name in patched_class_attributes}
     backend_calls = []
 
     class HistoricalBackendRMSNormFunction:
@@ -3805,103 +3776,45 @@ def test_qwen4_exp_grouped_rms_norm_falls_back_for_historical_backend_abi(monkey
     monkeypatch.setattr(rms_norm_transformers, "LigerRMSNormFunction", HistoricalBackendRMSNormFunction)
 
     config = _qwen4_exp_compat_config()
-    try:
-        if patch_before_construction:
-            apply_liger_kernel_to_qwen4_exp(
-                fused_linear_cross_entropy=False,
-                swiglu=False,
-                engram=False,
-                hyper_connection=False,
-            )
-            model = modeling_qwen4_exp.Qwen4ExpTextModel(config)
-        else:
-            model = modeling_qwen4_exp.Qwen4ExpTextModel(config)
-            apply_liger_kernel_to_qwen4_exp(
-                fused_linear_cross_entropy=False,
-                swiglu=False,
-                engram=False,
-                hyper_connection=False,
-                model=model,
-            )
-
-        ordinary = next(
-            module
-            for module in model.modules()
-            if getattr(module, "group_size", None) is None and isinstance(module, native_rms_norm_class)
+    if patch_before_construction:
+        apply_liger_kernel_to_qwen4_exp(
+            fused_linear_cross_entropy=False,
+            swiglu=False,
+            engram=False,
+            hyper_connection=False,
         )
-        grouped = next(module for module in model.modules() if getattr(module, "group_size", None) is not None)
-        ordinary_input = torch.randn(2, ordinary.weight.numel())
-        grouped_input = torch.randn(2, grouped.weight.numel())
-        expected_grouped = native_rms_norm_forward(grouped, grouped_input)
+        model = modeling_qwen4_exp.Qwen4ExpTextModel(config)
+    else:
+        model = modeling_qwen4_exp.Qwen4ExpTextModel(config)
+        apply_liger_kernel_to_qwen4_exp(
+            fused_linear_cross_entropy=False,
+            swiglu=False,
+            engram=False,
+            hyper_connection=False,
+            model=model,
+        )
 
-        assert ordinary(ordinary_input) is ordinary_input
-        calls_before_grouped = len(backend_calls)
-        torch.testing.assert_close(grouped(grouped_input), expected_grouped)
-        assert len(backend_calls) == calls_before_grouped
-        assert all(len(call) == 7 for call in backend_calls)
-        assert not getattr(grouped, "_liger_rms_norm_patched", False)
-        if patch_before_construction:
-            assert isinstance(grouped, native_rms_norm_class)
-        else:
-            assert grouped.forward.__func__ is native_rms_norm_forward
-            assert ordinary.forward.__func__ is LigerRMSNorm.forward
-    finally:
-        modeling_qwen4_exp.Qwen4ExpTextRMSNorm = native_rms_norm_class
-        native_rms_norm_class.forward = native_rms_norm_forward
-        for name in patched_class_attributes:
-            if had_class_attributes[name]:
-                setattr(native_rms_norm_class, name, saved_class_attributes[name])
-            elif hasattr(native_rms_norm_class, name):
-                delattr(native_rms_norm_class, name)
+    ordinary = next(
+        module
+        for module in model.modules()
+        if getattr(module, "group_size", None) is None and isinstance(module, native_rms_norm_class)
+    )
+    grouped = next(module for module in model.modules() if getattr(module, "group_size", None) is not None)
+    ordinary_input = torch.randn(2, ordinary.weight.numel())
+    grouped_input = torch.randn(2, grouped.weight.numel())
+    expected_grouped = native_rms_norm_forward(grouped, grouped_input)
 
-
-@pytest.mark.skipif(not is_qwen4_exp_available(), reason="qwen4_exp module not available")
-@pytest.mark.parametrize("patch_before_construction", [False, True], ids=["instance", "global"])
-def test_qwen4_exp_unsupported_activation_preserves_native_swiglu(patch_before_construction):
-    from transformers.models.qwen4_exp import modeling_qwen4_exp
-
-    from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen4_exp
-    from liger_kernel.transformers.swiglu import LigerExperts
-    from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
-
-    native_mlp_class = modeling_qwen4_exp.Qwen4ExpTextMLP
-    native_experts_class = modeling_qwen4_exp.Qwen4ExpTextExperts
-    native_mlp_forward = native_mlp_class.forward
-    native_experts_forward = native_experts_class.forward
-    config = _qwen4_exp_compat_config(hidden_act="gelu")
-
-    try:
-        if patch_before_construction:
-            apply_liger_kernel_to_qwen4_exp(
-                fused_linear_cross_entropy=False,
-                rms_norm=False,
-                engram=False,
-                hyper_connection=False,
-            )
-            model = modeling_qwen4_exp.Qwen4ExpTextModel(config)
-        else:
-            model = modeling_qwen4_exp.Qwen4ExpTextModel(config)
-            apply_liger_kernel_to_qwen4_exp(
-                fused_linear_cross_entropy=False,
-                rms_norm=False,
-                engram=False,
-                hyper_connection=False,
-                model=model,
-            )
-
-        sparse_moe = model.layers[0].mlp
-        assert inspect.getsource(sparse_moe.shared_expert.forward) != inspect.getsource(LigerQwen3MoeSwiGLUMLP.forward)
-        assert inspect.getsource(sparse_moe.experts.forward) != inspect.getsource(LigerExperts.forward)
-        hidden_states = torch.randn(3, config.hidden_size)
-        top_k_index = torch.tensor([[0], [1], [2]])
-        top_k_weights = torch.ones(3, 1)
-        assert sparse_moe.shared_expert(hidden_states).shape == hidden_states.shape
-        assert sparse_moe.experts(hidden_states, top_k_index, top_k_weights).shape == hidden_states.shape
-    finally:
-        native_mlp_class.forward = native_mlp_forward
-        native_experts_class.forward = native_experts_forward
-        modeling_qwen4_exp.Qwen4ExpTextMLP = native_mlp_class
-        modeling_qwen4_exp.Qwen4ExpTextExperts = native_experts_class
+    assert ordinary(ordinary_input) is ordinary_input
+    calls_before_grouped = len(backend_calls)
+    torch.testing.assert_close(grouped(grouped_input), expected_grouped)
+    assert len(backend_calls) == calls_before_grouped
+    assert all(len(call) == 7 for call in backend_calls)
+    assert not getattr(grouped, "_liger_rms_norm_patched", False)
+    if patch_before_construction:
+        assert isinstance(grouped, native_rms_norm_class)
+    else:
+        assert grouped.forward.__func__ is native_rms_norm_forward
+        assert ordinary.forward.__func__ is LigerRMSNorm.forward
 
 
 @pytest.mark.skipif(not is_qwen4_exp_available(), reason="qwen4_exp module not available")
@@ -3915,6 +3828,7 @@ def test_qwen4_exp_unsupported_activation_preserves_native_swiglu(patch_before_c
         pytest.param("gelu", "batched_mm", False, False, id="gelu-batched-mm"),
     ],
 )
+@pytest.mark.usefixtures("qwen4_exp_globals")
 def test_qwen4_exp_swiglu_and_experts_dispatch_matrix(
     monkeypatch,
     patch_before_construction,
@@ -3931,10 +3845,6 @@ def test_qwen4_exp_swiglu_and_experts_dispatch_matrix(
     from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
     from liger_kernel.utils import infer_device
 
-    native_mlp_class = modeling_qwen4_exp.Qwen4ExpTextMLP
-    native_experts_class = modeling_qwen4_exp.Qwen4ExpTextExperts
-    native_mlp_forward = native_mlp_class.forward
-    native_experts_forward = native_experts_class.forward
     config = _qwen4_exp_compat_config(
         hidden_act=hidden_act,
         experts_implementation=experts_implementation,
@@ -3973,45 +3883,40 @@ def test_qwen4_exp_swiglu_and_experts_dispatch_matrix(
     monkeypatch.setattr(LigerExperts, "forward", spy_liger_experts_forward)
     monkeypatch.setitem(ALL_EXPERTS_FUNCTIONS, "batched_mm", spy_batched_mm_forward)
 
-    try:
-        if patch_before_construction:
-            apply_liger_kernel_to_qwen4_exp(
-                fused_linear_cross_entropy=False,
-                rms_norm=False,
-                engram=False,
-                hyper_connection=False,
-            )
-            torch.manual_seed(11)
-            candidate = modeling_qwen4_exp.Qwen4ExpTextModel(copy.deepcopy(config)).to(test_device)
-        else:
-            torch.manual_seed(11)
-            candidate = modeling_qwen4_exp.Qwen4ExpTextModel(copy.deepcopy(config)).to(test_device)
-            apply_liger_kernel_to_qwen4_exp(
-                fused_linear_cross_entropy=False,
-                rms_norm=False,
-                engram=False,
-                hyper_connection=False,
-                model=candidate,
-            )
-        candidate.load_state_dict(reference_state)
-        assert candidate.state_dict().keys() == reference_state.keys()
-        candidate_sparse_moe = candidate.layers[0].mlp
-        actual_mlp = candidate_sparse_moe.shared_expert(hidden_states)
-        actual_experts = candidate_sparse_moe.experts(hidden_states, top_k_index, top_k_weights)
+    if patch_before_construction:
+        apply_liger_kernel_to_qwen4_exp(
+            fused_linear_cross_entropy=False,
+            rms_norm=False,
+            engram=False,
+            hyper_connection=False,
+        )
+        torch.manual_seed(11)
+        candidate = modeling_qwen4_exp.Qwen4ExpTextModel(copy.deepcopy(config)).to(test_device)
+    else:
+        torch.manual_seed(11)
+        candidate = modeling_qwen4_exp.Qwen4ExpTextModel(copy.deepcopy(config)).to(test_device)
+        apply_liger_kernel_to_qwen4_exp(
+            fused_linear_cross_entropy=False,
+            rms_norm=False,
+            engram=False,
+            hyper_connection=False,
+            model=candidate,
+        )
+    candidate.load_state_dict(reference_state)
+    assert candidate.state_dict().keys() == reference_state.keys()
+    candidate_sparse_moe = candidate.layers[0].mlp
+    actual_mlp = candidate_sparse_moe.shared_expert(hidden_states)
+    actual_experts = candidate_sparse_moe.experts(hidden_states, top_k_index, top_k_weights)
 
-        torch.testing.assert_close(actual_mlp, expected_mlp)
-        torch.testing.assert_close(actual_experts, expected_experts, atol=2e-5, rtol=2e-5)
-        assert calls["liger_mlp"] == int(expect_liger_mlp)
-        assert calls["liger_experts"] == int(expect_liger_experts)
-        assert calls["batched_mm"] == int(experts_implementation == "batched_mm")
-    finally:
-        native_mlp_class.forward = native_mlp_forward
-        native_experts_class.forward = native_experts_forward
-        modeling_qwen4_exp.Qwen4ExpTextMLP = native_mlp_class
-        modeling_qwen4_exp.Qwen4ExpTextExperts = native_experts_class
+    torch.testing.assert_close(actual_mlp, expected_mlp)
+    torch.testing.assert_close(actual_experts, expected_experts, atol=2e-5, rtol=2e-5)
+    assert calls["liger_mlp"] == int(expect_liger_mlp)
+    assert calls["liger_experts"] == int(expect_liger_experts)
+    assert calls["batched_mm"] == int(experts_implementation == "batched_mm")
 
 
 @pytest.mark.skipif(not is_qwen4_exp_available(), reason="qwen4_exp module not available")
+@pytest.mark.usefixtures("qwen4_exp_globals")
 def test_apply_liger_kernel_to_qwen4_exp_before_construction_feature_flag_independence():
     from transformers.models.qwen4_exp import modeling_qwen4_exp
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
@@ -4201,6 +4106,7 @@ def test_apply_liger_kernel_to_qwen4_exp_before_construction_feature_flag_indepe
         pytest.param("cuda", True, id="rocm"),
     ],
 )
+@pytest.mark.usefixtures("qwen4_exp_globals")
 def test_apply_liger_kernel_to_qwen4_exp_keeps_native_qwen_specific_paths_off_nvidia_cuda(
     monkeypatch, detected_device, is_rocm
 ):
@@ -4226,7 +4132,9 @@ def test_apply_liger_kernel_to_qwen4_exp_keeps_native_qwen_specific_paths_off_nv
     # HF module classes, and Module.modules() traverses the same objects the high-level patch sees.
     instance = object.__new__(modeling_qwen4_exp.Qwen4ExpTextModel)
     torch.nn.Module.__init__(instance)
-    instance.config = MagicMock(hidden_act="silu")
+    mock_config = MagicMock(hidden_act="silu")
+    mock_config.get_text_config.return_value = mock_config
+    instance.config = mock_config
     instance.gated_residual = object.__new__(modeling_qwen4_exp.Qwen4ExpTextGatedResidual)
     torch.nn.Module.__init__(instance.gated_residual)
     instance.decoder_layer = object.__new__(modeling_qwen4_exp.Qwen4ExpTextDecoderLayer)
@@ -4261,6 +4169,7 @@ def test_apply_liger_kernel_to_qwen4_exp_keeps_native_qwen_specific_paths_off_nv
 
 
 @pytest.mark.skipif(not is_qwen4_exp_available(), reason="qwen4_exp module not available")
+@pytest.mark.usefixtures("qwen4_exp_globals")
 def test_qwen4_exp_hyper_connection_global_and_instance_patch_fall_back_for_cpu_tensors(monkeypatch):
     from transformers.models.qwen4_exp import modeling_qwen4_exp
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
@@ -4311,7 +4220,9 @@ def test_qwen4_exp_hyper_connection_global_and_instance_patch_fall_back_for_cpu_
     existing_decoder = make_decoder()
     instance = object.__new__(modeling_qwen4_exp.Qwen4ExpTextModel)
     torch.nn.Module.__init__(instance)
-    instance.config = MagicMock(hidden_act="silu")
+    mock_config = MagicMock(hidden_act="silu")
+    mock_config.get_text_config.return_value = mock_config
+    instance.config = mock_config
     instance.gated_residual = existing_gated
     instance.decoder_layer = existing_decoder
 
@@ -4370,6 +4281,7 @@ def test_qwen4_exp_hyper_connection_global_and_instance_patch_fall_back_for_cpu_
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="Qwen4Exp Liger n-gram patch requires NVIDIA CUDA",
 )
+@pytest.mark.usefixtures("qwen4_exp_globals")
 def test_qwen4_exp_instance_ngram_fallback_is_isolated_from_class_patch():
     from types import MethodType
 
