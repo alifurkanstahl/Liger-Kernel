@@ -4,6 +4,8 @@ import gc
 import os
 import sys
 
+from types import MethodType
+
 import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -31,13 +33,15 @@ from liger_kernel.ops.qwen4_exp import LigerGroupRMSNormWrite4Function
 from liger_kernel.transformers.functional import liger_qwen4_exp_gr_write
 from liger_kernel.transformers.functional import liger_qwen4_exp_hyper_connection_pre
 from liger_kernel.transformers.functional import liger_qwen4_exp_ngram_hash
+from liger_kernel.transformers.monkey_patch import _patch_rms_norm_module
+from liger_kernel.transformers.qwen4_exp import liger_qwen4_exp_gated_residual_forward
 from liger_kernel.utils import infer_device
 
 device = infer_device()
 
 _MODEL_KEYS = ["name"]
 _GROUPED_RMS_CASES = ("group_rms_multi_consumer", "group_rms_write4")
-_ALL_CASES = ("gr_write", "hyper_pre", "ngram_hash", *_GROUPED_RMS_CASES)
+_ALL_CASES = ("gr_write", "hyper_pre", "gated_residual", "ngram_hash", *_GROUPED_RMS_CASES)
 
 
 def _qwen4_value(model, name):
@@ -61,8 +65,8 @@ def _setup_qwen4_exp(input: SingleBenchmarkRunInput):
     batch_size = cfg.get("bsz", 1)
     provider = input.kernel_provider
     sub_kernel = cfg["sub_kernel"]
-    if sub_kernel in _GROUPED_RMS_CASES and provider not in ("liger_generic", "liger"):
-        raise ValueError(f"{sub_kernel} providers must be 'liger_generic' or 'liger', got {provider!r}.")
+    if sub_kernel in _GROUPED_RMS_CASES and provider not in ("liger_rms_norm", "liger"):
+        raise ValueError(f"{sub_kernel} providers must be 'liger_rms_norm' or 'liger', got {provider!r}.")
     hidden_size = model.hidden_size
     hc_count = _qwen4_value(model, "hc_count")
     dtype = model.dtype
@@ -84,6 +88,42 @@ def _setup_qwen4_exp(input: SingleBenchmarkRunInput):
         fn = liger_qwen4_exp_hyper_connection_pre if provider == "liger" else qwen4_exp_hyper_connection_pre_ref
         fwd_fn = lambda: fn(mix_logits, normalized_input, hc_count)
         grad_tensors = [mix_logits, normalized_input]
+    elif sub_kernel == "gated_residual":
+        from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
+
+        shape = (batch_size, seq_len, hc_count * hidden_size)
+        config = Qwen4ExpTextConfig(
+            hidden_size=hidden_size,
+            hc_count=hc_count,
+            rms_norm_eps=model.rms_norm_eps,
+        )
+        module = Qwen4ExpTextGatedResidual(config, use_combine=True).to(device, dtype)
+        hyper_input = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+        # Isolate the complete GatedResidual read/write overhead around an arbitrary
+        # attention/MLP result without including the intervening block itself.
+        block_output = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype, requires_grad=True)
+        grad_mixed = torch.randn_like(block_output)
+        grad_written = torch.randn_like(hyper_input)
+        grad_tensors = [hyper_input, block_output, *module.parameters()]
+
+        if provider == "liger":
+            _patch_rms_norm_module(module.hc_norm, offset=1.0, casting_mode="gemma", in_place=False)
+            module.forward = MethodType(liger_qwen4_exp_gated_residual_forward, module)
+
+            def fwd_fn():
+                mixed_input, residual, write_logits = module(hyper_input, return_write_logits=True)
+                return mixed_input, liger_qwen4_exp_gr_write(block_output, residual, write_logits)
+
+        else:
+
+            def fwd_fn():
+                mixed_input, residual, injection_weights = module(hyper_input)
+                injection = block_output.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+                return mixed_input, residual + injection.flatten(-2)
+
+        def backward_fn(outputs, retain_graph):
+            torch.autograd.backward(outputs, (grad_mixed, grad_written), retain_graph=retain_graph)
     elif sub_kernel == "ngram_hash":
         from transformers.models.qwen4_exp.modeling_qwen4_exp import _build_layer_multipliers
         from transformers.models.qwen4_exp.modeling_qwen4_exp import _find_nth_prime_after
@@ -215,7 +255,7 @@ def bench_memory_qwen4_exp(input: SingleBenchmarkRunInput) -> SingleBenchmarkRun
             backward_fn,
             input.kernel_operation_mode,
             grad_tensors,
-            input.extra_benchmark_config["memory_kind"],
+            input.extra_benchmark_config.get("memory_kind", "peak"),
         )
     return run_memory_benchmark(fwd_fn, input.kernel_operation_mode)
 
@@ -281,7 +321,7 @@ def _run_multi_output_memory_benchmark(fwd_fn, backward_fn, mode, grad_tensors, 
 
 def _build_common_config(args, sub_kernel):
     extra_configs = {"sub_kernel": sub_kernel}
-    probe_provider = "liger_generic" if sub_kernel in _GROUPED_RMS_CASES else "torch"
+    probe_provider = "liger_rms_norm" if sub_kernel in _GROUPED_RMS_CASES else "torch"
     if args.sweep_mode == "model_config":
         return build_model_config_sweep(
             kernel_name=f"qwen4_exp_{sub_kernel}",
@@ -316,7 +356,7 @@ def main():
     args = parse_benchmark_script_args()
     for sub_kernel in _ALL_CASES:
         common_configs = _build_common_config(args, sub_kernel)
-        baseline_provider = "liger_generic" if sub_kernel in _GROUPED_RMS_CASES else "torch"
+        baseline_provider = "liger_rms_norm" if sub_kernel in _GROUPED_RMS_CASES else "torch"
         common_configs["kernel_providers"] = [baseline_provider, "liger"]
         operation_modes = ["forward"] if sub_kernel == "ngram_hash" else ["forward", "backward", "full"]
         run_benchmarks(
